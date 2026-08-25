@@ -6,10 +6,10 @@ paths:
 render:
   min_zoom: 8
   max_zoom: 16
-  line_width_px: 3            # épaisseur du trait avant flou
-  blur_sigma_px: 4             # intensité du flou gaussien appliqué une fois par tuile (l'effet "glow")
-  color_saturation: 6.0        # nombre de passages superposés pour atteindre le rouge plein (à ajuster)
-  contrast_boost: 9.0          # booste la visibilité des faibles densités (ex: un seul passage) sans
+  line_width_px: 2            # épaisseur du trait avant flou
+  blur_sigma_px: 2             # intensité du flou gaussien appliqué une fois par tuile (l'effet "glow")
+  color_saturation: 20.0        # nombre de passages superposés pour atteindre le rouge plein (à ajuster)
+  contrast_boost: 40.0          # booste la visibilité des faibles densités (ex: un seul passage) sans
                                 # changer color_saturation. Monte à 20-40+ si un passage unique te semble
                                 # trop discret ; plus la valeur est haute, plus même une seule trace ressort.
 

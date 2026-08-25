@@ -13,6 +13,10 @@ Built to run on modest hardware (a home NAS such as Synology, a Raspberry Pi...)
 - **Standard WMTS feed**: GetCapabilities + GetTile, both KVP and RESTful encodings, open CORS for web apps.
 - **Everything is configurable without touching the code**: colors, line width, saturation threshold, contrast, zoom range, folders, Garmin sync frequency.
 
+## Preview
+
+![Heatmap example](docs/heatmap-example.png)
+
 ## Architecture at a glance
 
 A single Python container (FastAPI + numpy/scipy/Pillow):

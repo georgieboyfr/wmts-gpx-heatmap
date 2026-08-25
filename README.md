@@ -15,7 +15,10 @@ Built to run on modest hardware (a home NAS such as Synology, a Raspberry Pi...)
 
 ## Preview
 
-![Heatmap example](docs/heatmap-example.png)
+<p align="center">
+  <img src="docs/heatmap-example.png" alt="Heatmap Example" width="500">
+</p>
+
 
 ## Architecture at a glance
 

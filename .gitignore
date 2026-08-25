@@ -1,0 +1,17 @@
+# Secrets - ne jamais commiter
+.env
+
+# Données locales (traces, tuiles, base, jetons de session)
+gpx/
+tiles/
+db/
+garmin_tokens/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store

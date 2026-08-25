@@ -1,0 +1,41 @@
+paths:
+  gpx_watch: /data/gpx      # dossier surveillé pour les nouveaux .gpx
+  tiles: /data/tiles        # cache des tuiles PNG générées
+  db: /data/db/points.sqlite3
+
+render:
+  min_zoom: 8
+  max_zoom: 16
+  line_width_px: 3            # épaisseur du trait avant flou
+  blur_sigma_px: 4             # intensité du flou gaussien appliqué une fois par tuile (l'effet "glow")
+  color_saturation: 6.0        # nombre de passages superposés pour atteindre le rouge plein (à ajuster)
+  contrast_boost: 9.0          # booste la visibilité des faibles densités (ex: un seul passage) sans
+                                # changer color_saturation. Monte à 20-40+ si un passage unique te semble
+                                # trop discret ; plus la valeur est haute, plus même une seule trace ressort.
+
+# Dégradé de couleur (fraction 0-1 -> [R,G,B,A]). Modifiable librement.
+# Ici : style "Strava heatmap" mais en tons bleus (fond sombre recommandé côté carte) :
+# transparent -> bleu marine -> bleu vif -> cyan -> blanc pour les zones les plus fréquentées.
+color_gradient:
+  - [0.00, [10,   15,  40,   0]]
+  - [0.15, [15,   40,  95, 130]]
+  - [0.40, [25,  110, 210, 190]]
+  - [0.65, [80,  190, 255, 225]]
+  - [0.85, [190, 235, 255, 245]]
+  - [1.00, [255, 255, 255, 255]]
+
+server:
+  # URL publique par laquelle ton NAS sera joignable (utilisée dans le GetCapabilities)
+  base_url: "http://ton-nas:8088"
+  layer_name: "heatmap"
+  layer_title: "Heatmap GPX"
+
+garmin:
+  enabled: false                    # passe à true pour activer la synchronisation Garmin Connect
+  sync_interval_minutes: 60         # fréquence de vérification des nouvelles activités
+  lookback_days_first_sync: 1825    # ancienneté max remontée lors du tout premier import (5 ans par defaut)
+  ingest_batch_size: 0              # 0 = n'ingère qu'une fois TOUT le téléchargement terminé (un seul
+                                     # bulk_ingest global, recommandé pour le tout premier rattrapage).
+                                     # Mettre un nombre (ex: 25) pour ingérer progressivement par lots
+                                     # au fur et à mesure du téléchargement.
+  # identifiants (GARMIN_EMAIL / GARMIN_PASSWORD) : PAS ici, voir .env / docker-compose.yml

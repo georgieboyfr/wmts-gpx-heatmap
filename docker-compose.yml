@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  wmts-gpx-heatmap:
+    build: .
+    image: wmts-gpx-heatmap:latest
+    container_name: wmts-gpx-heatmap
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    volumes:
+      - /volume1/docker/wmts-gpx-heatmap/gpx:/data/gpx               # dépose tes .gpx ici
+      - /volume1/docker/wmts-gpx-heatmap/tiles:/data/tiles            # cache des tuiles générées
+      - /volume1/docker/wmts-gpx-heatmap/db:/data/db                  # base des points ingérés
+      - /volume1/docker/wmts-gpx-heatmap/garmin_tokens:/data/garmin_tokens  # session Garmin mise en cache
+      - ./config.yaml:/config/config.yaml:ro
+    environment:
+      - CONFIG_PATH=/config/config.yaml
+      - GARMIN_EMAIL=${GARMIN_EMAIL:-}
+      - GARMIN_PASSWORD=${GARMIN_PASSWORD:-}
+      - GARMIN_TOKEN_STORE=/data/garmin_tokens

@@ -1,0 +1,11 @@
+fastapi==0.115.*
+uvicorn[standard]==0.32.*
+gpxpy==1.6.*
+mercantile==1.2.*
+numpy==2.1.*
+scipy==1.14.*
+pillow==11.0.*
+pyyaml==6.0.*
+watchdog==5.0.*
+garminconnect
+curl_cffi

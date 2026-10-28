@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1 — 2026-10-28
+
+### Fixes
+- Docker image build failing with `failed to parse Dockerfile: Syntax error - can't find = in "\n"` (malformed `LABEL` line in 1.0.0).
+
 ## 1.0.0 — 2026-10-28
 
 First versioned release.

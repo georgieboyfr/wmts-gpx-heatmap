@@ -1,7 +1,8 @@
 services:
   wmts-gpx-heatmap:
-    build: .
-    image: wmts-gpx-heatmap:latest
+    # image publiée sur GitHub (Intel/AMD et ARM) : rien d'autre à télécharger.
+    # Pour construire depuis le code source à la place : remplacer par `build: .`
+    image: ghcr.io/georgieboyfr/wmts-gpx-heatmap:1.0.2
     container_name: wmts-gpx-heatmap
     restart: unless-stopped
     # utilisateur propriétaire des dossiers de données ci-dessous (voir PUID/PGID dans .env)
@@ -13,9 +14,10 @@ services:
       - /volume1/docker/wmts-gpx-heatmap/tiles:/data/tiles            # cache des tuiles générées
       - /volume1/docker/wmts-gpx-heatmap/db:/data/db                  # base des points ingérés
       - /volume1/docker/wmts-gpx-heatmap/garmin_tokens:/data/garmin_tokens  # session Garmin mise en cache
-      - ./config.yaml:/config/config.yaml:ro
+      # facultatif : config.yaml personnalisé (sinon, configuration par défaut de l'image)
+      # - ./config.yaml:/config/config.yaml:ro
     environment:
-      - CONFIG_PATH=/config/config.yaml
+      - BASE_URL=${BASE_URL:-http://localhost:8088}   # URL publique, utilisée dans le GetCapabilities
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - GARMIN_EMAIL=${GARMIN_EMAIL:-}
       - GARMIN_PASSWORD=${GARMIN_PASSWORD:-}

@@ -35,32 +35,37 @@ A single Python container (FastAPI + numpy/scipy/Pillow):
 
 ## Installation
 
-```bash
-git clone <repo-url> wmts-gpx-heatmap
-cd wmts-gpx-heatmap
+A ready-to-use image is published for Intel/AMD and ARM machines: **`ghcr.io/georgieboyfr/wmts-gpx-heatmap`**. All you need is a compose file — no source code, no `git`, no build. This also works as-is as a *project* in Synology Container Manager or Portainer.
 
-mkdir -p gpx tiles db garmin_tokens
-
-# edit config.yaml: server.base_url must point to your machine (IP or hostname)
-#   base_url: "http://192.168.1.50:8088"
-
-cp .env.example .env
-# edit .env: set ADMIN_TOKEN (e.g. `openssl rand -hex 32`) and PUID/PGID
-# (owner of the data folders, see `id` on the host)
-
-docker compose up -d --build
+```yaml
+services:
+  wmts-gpx-heatmap:
+    image: ghcr.io/georgieboyfr/wmts-gpx-heatmap:1.0.2
+    container_name: wmts-gpx-heatmap
+    restart: unless-stopped
+    user: "1000:1000"                    # owner of the data folders (`id` on the host; often 1026:100 on Synology)
+    ports:
+      - "8088:8088"
+    volumes:
+      - /volume1/docker/wmts-gpx-heatmap/gpx:/data/gpx
+      - /volume1/docker/wmts-gpx-heatmap/tiles:/data/tiles
+      - /volume1/docker/wmts-gpx-heatmap/db:/data/db
+      - /volume1/docker/wmts-gpx-heatmap/garmin_tokens:/data/garmin_tokens
+    environment:
+      - BASE_URL=https://heatmap.example.com   # public URL, used in GetCapabilities
+      - ADMIN_TOKEN=a-long-random-string        # password of the /admin interface
+      - GARMIN_TOKEN_STORE=/data/garmin_tokens
 ```
 
-The container runs as the non-root `PUID:PGID` user (default `1000:1000`): the data folders mounted in `docker-compose.yml` must be writable by that user.
+1. Create the four data folders, writable by the `user:` above.
+2. Start the stack (`docker compose up -d`, or *Build* in Container Manager).
+3. Open `http://<host>:8088/admin` and sign in with `ADMIN_TOKEN`.
 
-Port `8088` is exposed by default (configurable in `docker-compose.yml`). Drop your `.gpx` files into the `gpx/` folder (e.g. via a network share, a scheduled task, or Garmin sync — see below).
+The repository's [`docker-compose.yml`](docker-compose.yml) is the same file, reading its values from a `.env` (copy [`.env.example`](.env.example)). `config.yaml` is optional: the defaults shipped in the image are used, render and Garmin settings are changed from the admin, and a custom file can still be mounted on `/config/config.yaml`.
 
-**Rebuilding after a code / Python config change:**
-```bash
-docker compose down
-docker compose up -d --build
-```
-*(A plain `docker compose restart` is enough to reload `config.yaml`, but not to pick up a source code change — when in doubt, rebuild.)*
+**Updating:** change the version in `image:` (see the [changelog](CHANGELOG.md)) and recreate the container (`docker compose pull && docker compose up -d`). The `latest`, `1` and `1.0` tags are also published.
+
+**Building from source** instead: clone the repository, replace `image:` with `build: .` and run `docker compose up -d --build`.
 
 ## Administration (`/admin`)
 
@@ -209,6 +214,7 @@ The session token is stored in the `garmin_tokens` volume (a remembered password
 
 ## Upgrading from an earlier version
 
+- Switch the compose file to the published image (see *Installation*): replace `build: .` with `image: ghcr.io/georgieboyfr/wmts-gpx-heatmap:<version>`. If you had a customized `config.yaml`, keep mounting it (`./config.yaml:/config/config.yaml:ro`); otherwise set `BASE_URL`.
 - The container no longer runs as root. Either give the data folders to the default user (`sudo chown -R 1000:1000 /volume1/docker/wmts-gpx-heatmap`) or set `PUID`/`PGID` in `.env` to their current owner.
 - Set `ADMIN_TOKEN` in `.env` (the admin is disabled without it).
 - The existing database is migrated automatically and nothing is re-imported. Run *Reindex everything* once from the admin so that deleting or modifying files imported before the upgrade is also handled — and to clean up possible duplicate tracks left by older versions.

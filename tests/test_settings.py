@@ -39,3 +39,17 @@ def test_unreadable_settings_file_falls_back_to_config(tmp_path):
     path.write_text("{pas du json", encoding="utf-8")
     base = make_config(tmp_path)
     assert Settings(base, path).effective()["render"] == base["render"]
+
+
+def test_load_config_falls_back_to_default_and_applies_base_url(tmp_path):
+    from pathlib import Path
+    from app.settings import load_config
+    default = Path(__file__).resolve().parent.parent / "config.yaml"
+    path, cfg = load_config(tmp_path / "absent.yaml", default, "https://heatmap.example.test")
+    assert path == str(default)
+    assert cfg["server"]["base_url"] == "https://heatmap.example.test"
+    assert cfg["paths"]["db"].startswith("/data/")  # chemins prévus pour les volumes de l'image
+
+    custom = tmp_path / "config.yaml"
+    custom.write_text("server: {base_url: 'http://x', layer_name: h, layer_title: H}\n", encoding="utf-8")
+    assert load_config(custom, default)[1]["server"]["base_url"] == "http://x"

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.2 — 2026-10-28
+
+### Changes
+- Docker image published on GitHub Container Registry for amd64 and arm64 (`ghcr.io/georgieboyfr/wmts-gpx-heatmap`), built and tested automatically for each version tag. `docker-compose.yml` now uses it: no source code or git needed on the host.
+- `config.yaml` is optional: without a mounted file, the defaults shipped in the image are used, and the public URL is set with the `BASE_URL` environment variable.
+
 ## 1.0.1 — 2026-10-28
 
 ### Fixes

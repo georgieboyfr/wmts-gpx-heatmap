@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="wmts-gpx-heatmap" \
-      org.opencontainers.image.version="1.0.1"
+      org.opencontainers.image.version="1.0.2"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -15,6 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN useradd --uid 1000 --create-home app
 
 COPY app /app/app
+# configuration par défaut, utilisée si aucun config.yaml n'est monté sur /config
+COPY config.yaml /app/config.yaml
 
 USER app
 

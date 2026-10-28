@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import List
 from xml.sax.saxutils import escape
 
-import yaml
 from fastapi import APIRouter, Body, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,7 +22,7 @@ from pydantic import BaseModel
 from . import __version__, garmin_account, garmin_sync, heatmap, watcher
 from .gpx_utils import is_gpx, normalize_path
 from .jobs import JobCancelled, JobManager, LogBuffer
-from .settings import Settings
+from .settings import Settings, load_config
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("main")
@@ -32,9 +31,11 @@ logging.getLogger().addHandler(LOG_BUFFER)
 # l'admin interroge l'API toutes les secondes : inutile d'en remplir les logs d'accès
 logging.getLogger("uvicorn.access").addFilter(lambda record: "/admin/api/" not in record.getMessage())
 
-CONFIG_PATH = os.environ.get("CONFIG_PATH", "/config/config.yaml")
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    CONFIG = yaml.safe_load(f)
+CONFIG_PATH, CONFIG = load_config(
+    os.environ.get("CONFIG_PATH", "/config/config.yaml"),
+    Path(__file__).resolve().parent.parent / "config.yaml",
+    os.environ.get("BASE_URL"),
+)
 
 LAYER = CONFIG["server"]["layer_name"]
 TITLE = CONFIG["server"]["layer_title"]

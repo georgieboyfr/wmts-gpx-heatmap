@@ -13,6 +13,8 @@ import os
 import threading
 from pathlib import Path
 
+import yaml
+
 log = logging.getLogger("settings")
 
 RENDER_KEYS = ("min_zoom", "max_zoom", "line_width_px", "blur_sigma_px", "color_saturation", "contrast_boost")
@@ -28,6 +30,21 @@ GARMIN_LIMITS = {  # clé -> (min, max)
     "lookback_days_first_sync": (1, 100 * 365),
     "ingest_batch_size": (0, 10000),
 }
+
+
+def load_config(path, default_path, base_url=None):
+    """Lit config.yaml. Le fichier est facultatif : s'il n'existe pas, la configuration
+    par défaut livrée avec l'image est utilisée. base_url (variable BASE_URL) remplace
+    server.base_url. Retourne (chemin réellement lu, configuration)."""
+    path = str(path)
+    if not os.path.exists(path):
+        log.info("%s introuvable : configuration par défaut utilisée (%s)", path, default_path)
+        path = str(default_path)
+    with open(path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    if base_url:
+        config["server"]["base_url"] = base_url
+    return path, config
 
 
 def validate_garmin(values: dict) -> dict:

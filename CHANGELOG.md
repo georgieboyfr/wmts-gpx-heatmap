@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.4 — 2026-10-28
+
+### Performance
+- Tile rendering about 3 times faster (measured on a full recompute): each tile now filters the points of its parent tile at the previous zoom instead of all the points of its region, so densely ridden areas no longer slow the computation down at high zooms; PNG tiles are compressed in a single pass (`compress_level=6` instead of `optimize=True`, ~3 % larger files).
+
 ## 1.0.3 — 2026-10-28
 
 ### Fixes

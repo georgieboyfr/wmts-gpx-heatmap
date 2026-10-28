@@ -493,29 +493,39 @@ class HeatmapEngine:
         return self._render_tiles(tiles, params, progress)
 
     def _render_tiles(self, tiles, params, progress=NULL_PROGRESS):
-        """Rend les tuiles en ne filtrant le jeu complet de points qu'une fois par tuile
-        parente (au zoom minimal) : chaque tuile ne teste ensuite que les points de sa
-        région, au lieu de parcourir tous les points à chaque fois."""
+        """Rend les tuiles zoom par zoom, du plus petit au plus grand. Les points retenus
+        pour une tuile sont filtrés parmi ceux de sa tuile mère au zoom précédent (la zone
+        d'une tuile fille est incluse dans celle de sa mère) : le coût d'une tuile dépend
+        des points de sa zone, et non de tous ceux de la région, ce qui évite qu'une zone
+        très fréquentée ralentisse fortement le calcul aux grands zooms."""
         progress.phase("Calcul des tuiles", len(tiles))
         pts = self.pts
-        zp = params.min_zoom
-        by_parent = defaultdict(list)
-        for z, x, y in tiles:
-            by_parent[(x >> (z - zp), y >> (z - zp))].append((z, x, y))
-
         all_idx = np.arange(len(pts))
+        selections = {}  # (z, x, y) -> indices des points nécessaires à la tuile
+
+        def selection(z, x, y):
+            key = (z, x, y)
+            if key not in selections:
+                source = all_idx if z <= params.min_zoom else selection(z - 1, x >> 1, y >> 1)
+                selections[key] = self._select(pts, source, *self._canvas_bounds(params, z, x, y))
+            return selections[key]
+
         written = set()
-        for (px, py), children in by_parent.items():
-            candidates = self._select(pts, all_idx, *self._canvas_bounds(params, zp, px, py))
-            for z, x, y in children:
-                out = self.tile_path(z, x, y)
-                img = self._tile_image(pts, params, z, x, y, candidates)
-                if img is None:
-                    out.unlink(missing_ok=True)
-                else:
-                    self._write_tile(out, img)
-                    written.add((z, x, y))
-                progress.advance()
+        current_zoom = None
+        for z, x, y in sorted(tiles):
+            if z != current_zoom:
+                # nouveau zoom : seules les sélections du zoom précédent servent encore
+                for key in [k for k in selections if k[0] < z - 1]:
+                    del selections[key]
+                current_zoom = z
+            out = self.tile_path(z, x, y)
+            img = self._draw_tile(pts, params, z, x, y, selection(z, x, y))
+            if img is None:
+                out.unlink(missing_ok=True)
+            else:
+                self._write_tile(out, img)
+                written.add((z, x, y))
+            progress.advance()
         return written
 
     @staticmethod
@@ -541,7 +551,10 @@ class HeatmapEngine:
 
     def _tile_image(self, pts, params, z, x, y, candidates):
         """Image RGBA d'une tuile, ou None si aucune trace ne la touche."""
-        idx = self._select(pts, candidates, *self._canvas_bounds(params, z, x, y))
+        return self._draw_tile(pts, params, z, x, y, self._select(pts, candidates, *self._canvas_bounds(params, z, x, y)))
+
+    def _draw_tile(self, pts, params, z, x, y, idx):
+        """Dessine une tuile à partir des points déjà sélectionnés pour elle (voir _select)."""
         if len(idx) == 0:
             return None
 
@@ -617,7 +630,9 @@ class HeatmapEngine:
         # concurrente lit l'ancienne ou la nouvelle tuile, jamais une tuile à moitié écrite
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
-        img.save(tmp, format="PNG", optimize=True)
+        # compress_level=6 plutôt qu'optimize=True : ~3 fois plus rapide (optimize essaie
+        # plusieurs réglages par tuile) pour des fichiers à peine plus gros (~3 %)
+        img.save(tmp, format="PNG", compress_level=6)
         os.replace(tmp, path)
 
     @staticmethod

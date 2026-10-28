@@ -40,7 +40,7 @@ A ready-to-use image is published for Intel/AMD and ARM machines: **`ghcr.io/geo
 ```yaml
 services:
   wmts-gpx-heatmap:
-    image: ghcr.io/georgieboyfr/wmts-gpx-heatmap:1.0.3
+    image: ghcr.io/georgieboyfr/wmts-gpx-heatmap:1.0.4
     container_name: wmts-gpx-heatmap
     restart: unless-stopped
     user: "1000:1000"                    # owner of the data folders (`id` on the host; often 1026:100 on Synology)

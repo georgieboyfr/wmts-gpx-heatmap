@@ -7,8 +7,8 @@ Built to run on modest hardware (a home NAS such as Synology, a Raspberry Pi...)
 ## Features
 
 - **Heatmap rendering** by accumulating tracks (each track is drawn as a line, not a point cloud), with a gaussian "glow" blur and a fully customizable color gradient.
-- **Automatic folder watching**: drop a `.gpx` file, it's on the map within seconds.
-- **Optimized bulk import**: on first startup (or on demand), hundreds of pre-existing files are processed as a single batch — far faster than processing them one by one.
+- **Automatic folder watching**: drop a `.gpx` file, it's on the map within seconds. Deleting or replacing a file removes or updates its track too.
+- **Optimized batch import**: files are always ingested in batches (at startup, and when many files land at once while running) — each affected tile is rendered once per batch, not once per file.
 - **Automatic Garmin Connect sync** (optional): fetches and ingests your activities with no manual step, with an automatic fallback to the TCX export when Garmin's GPX export is incomplete.
 - **Standard WMTS feed**: GetCapabilities + GetTile, both KVP and RESTful encodings, open CORS for web apps.
 - **Everything is configurable without touching the code**: colors, line width, saturation threshold, contrast, zoom range, folders, Garmin sync frequency.
@@ -25,7 +25,8 @@ Built to run on modest hardware (a home NAS such as Synology, a Raspberry Pi...)
 A single Python container (FastAPI + numpy/scipy/Pillow):
 - GPX tracks are stored as continuous polylines (SQLite for persistence, numpy arrays in memory for computation);
 - tiles are pre-rendered as PNG and served as static files (no on-the-fly rendering per request);
-- only the tiles actually affected by a new track are (re)computed — never the whole pyramid.
+- only the tiles actually affected by a new track are (re)computed — never the whole pyramid;
+- tiles are written atomically, so a client never receives a half-written tile, and are served with an `ETag` (cheap `304` revalidation).
 
 ## Requirements
 
@@ -43,8 +44,14 @@ mkdir -p gpx tiles db garmin_tokens
 # edit config.yaml: server.base_url must point to your machine (IP or hostname)
 #   base_url: "http://192.168.1.50:8088"
 
+cp .env.example .env
+# edit .env: set ADMIN_TOKEN (e.g. `openssl rand -hex 32`) and PUID/PGID
+# (owner of the data folders, see `id` on the host)
+
 docker compose up -d --build
 ```
+
+The container runs as the non-root `PUID:PGID` user (default `1000:1000`): the data folders mounted in `docker-compose.yml` must be writable by that user.
 
 Port `8088` is exposed by default (configurable in `docker-compose.yml`). Drop your `.gpx` files into the `gpx/` folder (e.g. via a network share, a scheduled task, or Garmin sync — see below).
 
@@ -55,6 +62,18 @@ docker compose up -d --build
 ```
 *(A plain `docker compose restart` is enough to reload `config.yaml`, but not to pick up a source code change — when in doubt, rebuild.)*
 
+## Administration (`/admin`)
+
+Open **`http://<nas>:8088/admin`** and sign in with the `ADMIN_TOKEN` from `.env` (the admin is disabled when it is not set). Everything is done from there, no manual `POST` needed:
+
+- **Dashboard** — files, points, tiles, Garmin status; one-click *Rescan folder*, *Recompute tiles*, *Sync Garmin*, *Reindex everything*. Every long operation runs as a background **task** with live progress per phase (files read, tiles computed, ETA), a **Cancel** button and a history.
+- **Garmin** — connect your account (email + password, then the **MFA code** if Garmin asks for one), see its status, last/next sync, sync now, disconnect. When connecting you choose whether the password is **remembered** (stored on the server, so the session can be renewed on its own) or **not** (recommended: only the session token is kept; reconnect from the admin if it ever expires). Auto-sync on/off, interval, history depth and batch size are editable live.
+- **Data** — drag & drop `.gpx` files to upload them; searchable list of imported files with their status, errors on unreadable files, and *Retry*.
+- **Render** — line width, blur, saturation, contrast, zoom range and color gradient, with a **live preview map** computed on the fly from the form; *Apply* saves and recomputes every tile.
+- **Logs** — the application log, live, filterable by level.
+
+Settings changed in the admin are stored as overrides in `settings.json` next to the database (`/data/db`), on top of `config.yaml`; *Back to config.yaml* removes them. The map basemap of the Render tab is loaded from OpenStreetMap (internet access needed for it only).
+
 ## Available URLs
 
 | URL | Method | Description |
@@ -63,10 +82,12 @@ docker compose up -d --build
 | `/wmts?SERVICE=WMTS&REQUEST=GetTile&LAYER=heatmap&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}` | GET | PNG tile, KVP encoding |
 | `/wmts/1.0.0/heatmap/default/GoogleMapsCompatible/{z}/{y}/{x}.png` | GET | PNG tile, RESTful encoding (works as a plain tile source in Leaflet/MapLibre) |
 | `/health` | GET | Confirms the service is up, returns the number of points currently in memory |
-| `/admin/config-status` | GET | The configuration **actually loaded in memory** (useful to confirm a restart picked up a `config.yaml` change) |
-| `/admin/rerender` | POST | Recomputes **all** tiles from scratch (after a style/gradient change) |
-| `/admin/bulk-import` | POST | Imports, as a single batch, every `.gpx` in the watched folder not yet ingested (use after dropping many files while the container was already running) |
-| `/admin/garmin-sync` | POST | Triggers an immediate Garmin Connect sync (in addition to the automatic cycle) |
+| `/admin` | GET | Administration interface (see above) |
+
+For scripts, the admin API accepts the token as a bearer token. The historical endpoints still exist and now start a background task (`202`, with the task in the response): `POST /admin/rerender`, `/admin/bulk-import` (rescan), `/admin/reindex`, `/admin/garmin-sync`, and `GET /admin/config-status`. The admin's own API lives under `/admin/api/` (e.g. `POST /admin/api/actions/{rescan|rerender|reindex|garmin-sync}`, `GET /admin/api/status`).
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" http://<nas>:8088/admin/api/actions/rescan
+```
 
 Replace `<nas>` / the hostname and port with your own deployment in every example below.
 
@@ -105,7 +126,7 @@ const options = optionsFromCapabilities(caps, { layer: 'heatmap', matrixSet: 'Go
 
 ## Configuration (`config.yaml`)
 
-Only read **at container startup** — after any change, `docker compose restart` (check `/admin/config-status` to confirm what's actually loaded).
+Only read **at container startup** — after any change, `docker compose restart`. The `render`, `color_gradient` and `garmin` sections are the **defaults**: they can be changed live from the admin, which then takes precedence for the values it changed (*Back to config.yaml* in the admin restores them).
 
 ```yaml
 paths:
@@ -141,7 +162,7 @@ garmin:
   lookback_days_first_sync: 1825    # max history depth on the very first sync
   ingest_batch_size: 0              # 0 = a single batch ingest once the whole download finishes
                                      # >0 = ingest progressively, in batches of this size
-  # credentials: NOT here, see .env / docker-compose.yml
+  # account: connected from the admin (Garmin tab), not here
 ```
 
 ### Tuning the visual rendering
@@ -149,15 +170,13 @@ garmin:
 - **A single pass too faint?** Raise `contrast_boost` (e.g. 20-40) rather than lowering `color_saturation` — this keeps the distinction between lightly and heavily traveled areas.
 - **Everything saturates to red/white too fast?** Raise `color_saturation`.
 - **Gradient**: fully customizable (colors, transparency, number of stops). Example included: a "Strava-style" blue gradient, best viewed over a dark basemap.
-- After any rendering change, call `POST /admin/rerender` so already-generated tiles get recomputed (otherwise only new ingests benefit from it).
+- Easiest: tune it in the admin's **Render** tab with the live preview, then *Apply* (tiles are recomputed automatically). After editing `config.yaml` instead, restart and run *Recompute tiles*.
 
 ## Bulk import (hundreds of GPX files)
 
-- **On the very first startup**: everything already present in `gpx/` is automatically processed as a single batch.
-- **If you drop many files while the container is already running**: they go through the watcher's one-file-at-a-time path (slower, and it slows down further as the dataset grows). Drop them all first, then:
-  ```bash
-  curl -X POST http://<nas>:8088/admin/bulk-import
-  ```
+- **At startup**: the database is aligned with `gpx/` in a single batch — new or modified files are imported, tracks of files deleted while the service was stopped are removed. This runs in the background: the server answers right away and tiles appear as soon as the batch is done.
+- **While running**: the watcher waits until a file has stopped changing (slow network copies are handled), then ingests every file ready at that moment as one batch. Dropping hundreds of files at once is therefore processed in a few batches, not one by one.
+- **From the admin**: drop files in the *Data* tab, or click *Rescan folder* if file events were missed (some network shares don't report them). Progress is shown live on the dashboard.
 
 **Time estimate** (measured, extrapolated for an entry/mid-range NAS CPU such as a Celeron): roughly 480-500 ms per file in batch mode for a ~1h track at 1 point/second, default zoom range — so **~20-30 minutes for 600 files**. Longer if your tracks are longer or the zoom range wider; shorter if you reduce `max_zoom`.
 
@@ -165,39 +184,40 @@ garmin:
 
 Uses the unofficial [`garminconnect`](https://github.com/cyberjunky/python-garminconnect) library, which replicates the mobile app's authentication flow — **this is not a Garmin-sanctioned public API**. It can break if Garmin changes their auth flow, and automating it is at your own risk with respect to their terms of service (personal use only, similar in spirit to other community tools like GarminDB).
 
-**Setup:**
+**Setup** — all from the admin's **Garmin** tab:
 
-1. Copy `.env.example` to `.env` and fill in `GARMIN_EMAIL` / `GARMIN_PASSWORD` (never commit/share this file — already excluded via `.gitignore`).
-2. In `config.yaml`, set `garmin.enabled: true`.
-3. `docker compose up -d --build`.
-4. **One-time interactive login** (handles any MFA prompt and generates a cached session token, reused and refreshed automatically afterward):
-   ```bash
-   docker exec -it wmts-gpx-heatmap python -m app.garmin_login
-   ```
-5. From then on, new activities are checked every `sync_interval_minutes`, downloaded, and ingested automatically.
+1. Enter your Garmin Connect email and password, and choose whether the password is remembered (see *Administration* above). If Garmin asks for a verification code (MFA), a field appears to type it (it must be entered within 5 minutes).
+2. Turn on **automatic sync** and adjust the interval if needed. The first sync starts right away; then new activities are checked every interval, downloaded, and ingested automatically.
+3. *Sync now* triggers an immediate sync; its progress shows on the dashboard.
 
-**Trigger an immediate sync:**
-```bash
-curl -X POST http://<nas>:8088/admin/garmin-sync
-```
+The session token is stored in the `garmin_tokens` volume (a remembered password too, in `credentials.json`, readable only by the service user). Alternatives still supported: `GARMIN_EMAIL` / `GARMIN_PASSWORD` in `.env` act as a remembered password, and `docker exec -it wmts-gpx-heatmap python -m app.garmin_login` performs the login from a terminal.
 
 **Specific behaviors:**
 - Automatic fallback to the **TCX** export when Garmin's GPX export is empty (a metadata-only "shell" with no GPS points, which can happen even for a legitimate outdoor activity — a known Garmin quirk).
-- A corrupted GPX file or a GPS-less activity doesn't interrupt the rest of the batch.
-- If the session expires (rare, after several months), the service logs a clear error instead of looping/crashing: just repeat step 4.
+- A corrupted GPX file or a GPS-less activity doesn't interrupt the rest of the batch; files already downloaded are ingested even if the sync stops on an error.
+- Files are written atomically and ingested by the sync itself, in batches of `ingest_batch_size` (the watcher leaves them alone).
+- If the session expires (rare) and cannot be renewed on its own, the Garmin tab shows **Reconnection needed**: reconnect from there.
 
 ## Troubleshooting
 
-- **A `config.yaml` change seems to have no effect** → config is only read at startup. Check what's actually loaded with `GET /admin/config-status`, restart if needed.
-- **`/admin/rerender` doesn't seem to change anything** → same cause: restart the container first to load the new config, then call `/admin/rerender`.
+- **A `config.yaml` change seems to have no effect** → config is only read at startup, and a value changed in the admin takes precedence over it (the admin says "modified from the admin"; *Back to config.yaml* restores the file's values).
 - **`No module named app.xxx` when running `docker exec`** → the running image predates the code currently on disk: `docker compose down && docker compose up -d --build`.
 - **`no such service` with `docker compose`** → the command isn't run from the folder containing `docker-compose.yml` (`cd` into the project folder, check with `docker compose config --services`).
-- **Ingestion slows down after many files trickle in over time** → expected with the one-file-at-a-time path; use `/admin/bulk-import` (see above).
+- **The admin says it is disabled / `403` on `/admin/*`** → `ADMIN_TOKEN` isn't set in `.env` (restart after setting it). `401` from a script → send `Authorization: Bearer <ADMIN_TOKEN>`.
+- **`Permission denied` / `readonly database` in the logs** → the data folders aren't writable by `PUID:PGID` (see *Upgrading* below).
+- **The container exits on startup with `Configuration invalide`** → a `render` / `color_gradient` value in `config.yaml` is out of range; the message says which one.
+
+## Upgrading from an earlier version
+
+- The container no longer runs as root. Either give the data folders to the default user (`sudo chown -R 1000:1000 /volume1/docker/wmts-gpx-heatmap`) or set `PUID`/`PGID` in `.env` to their current owner.
+- Set `ADMIN_TOKEN` in `.env` (the admin is disabled without it).
+- The existing database is migrated automatically and nothing is re-imported. Run *Reindex everything* once from the admin so that deleting or modifying files imported before the upgrade is also handled — and to clean up possible duplicate tracks left by older versions.
+- An existing Garmin session (token from `garmin_login`) keeps working; `garmin.enabled` from `config.yaml` is still honored until changed in the admin.
 
 ## Known limitations
 
-- Point-to-tile filtering uses "raw" numpy (fast up to a few million points; beyond that, a spatial grid index would be worth adding).
-- No authentication on tiles or `/admin/*` endpoints — put this behind a reverse proxy with restricted access if exposed to the internet.
+- Point-to-tile filtering uses numpy, narrowed per parent tile at `min_zoom` (fast up to a few million points; beyond that, a real spatial index would be worth adding).
+- Tiles are not authenticated, and the admin only by a shared token over plain HTTP (the session cookie is marked `Secure` automatically behind HTTPS) — put this behind a reverse proxy with TLS and restricted access if exposed to the internet.
 - CORS is open to any origin (`*`), read-only — restrict `allow_origins` in `app/main.py` if the service leaves your local network.
 
 ## Contributing

@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.env.*
+gpx/
+tiles/
+db/
+garmin_tokens/
+docs/
+tests/
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+*.md

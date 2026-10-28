@@ -1,15 +1,32 @@
 """
 Coeur du système :
 - stocke les traces issues des GPX ingérés (SQLite -> tableaux numpy en mémoire),
-  groupées par segment continu (une trace = une polyligne)
+  groupées par segment continu (une trace = une polyligne), chaque segment étant
+  rattaché à son fichier d'origine (suppression / modification d'un GPX possibles)
 - pour un nouveau GPX, ne recalcule que les tuiles impactées (par zoom)
 - rendu = chaque segment est dessiné comme UNE ligne (donc 1 passage = 1 "unité",
   même si le tracé se recoupe lui-même), les segments s'additionnent, puis un
   flou gaussien est appliqué une fois par tuile pour l'effet "heatmap"
+
+Toutes les opérations qui modifient la base, les tableaux en mémoire ou les tuiles
+passent par un verrou unique : watcher, sync Garmin et endpoints admin peuvent
+tourner en parallèle sans doublons ni identifiants de segment en collision. La
+lecture des tuiles n'en a pas besoin (elles sont remplacées de façon atomique), pas
+plus que l'aperçu de rendu de l'admin : les points en mémoire et les réglages de
+rendu sont des objets immuables, remplacés d'un bloc à chaque modification.
+
+Les opérations longues acceptent un objet `progress` (voir jobs.py) pour remonter
+leur avancement et pouvoir être annulées.
 """
+import io
 import logging
 import math
+import os
+import sqlite3
 import threading
+import time
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import mercantile
@@ -18,342 +35,664 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 
 from . import gpx_utils
-import sqlite3
+from .gpx_utils import normalize_path
+from .jobs import NULL_PROGRESS
 
 log = logging.getLogger("heatmap")
 
-PAD = 32  # marge (px) autour de chaque tuile pour éviter les coutures aux bords (ligne + flou)
+TILE_SIZE = 256
+BLUR_TRUNCATE = 4.0  # rayon du noyau gaussien, en sigmas (valeur par défaut de scipy)
+MAX_LAT = 85.05
+FILE_STATUS = {1: "ok", 0: "failed", 2: "legacy"}
 
-_lock = threading.Lock()
+
+def _file_signature(path):
+    """(mtime, taille) du fichier, ou None s'il n'existe plus."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return st.st_mtime, st.st_size
+
+
+def _list_gpx(folder):
+    return [normalize_path(p) for p in Path(folder).iterdir() if p.is_file() and gpx_utils.is_gpx(p)]
+
+
+def _is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _validate_config(render: dict, gradient) -> None:
+    errors = []
+    min_z, max_z = render.get("min_zoom"), render.get("max_zoom")
+    if (not isinstance(min_z, int) or not isinstance(max_z, int) or isinstance(min_z, bool)
+            or not 0 <= min_z <= max_z <= 24):
+        errors.append("render.min_zoom / max_zoom doivent être des entiers avec 0 <= min_zoom <= max_zoom <= 24")
+    lw = render.get("line_width_px", 3)
+    if not _is_number(lw) or not 1 <= lw <= 64:
+        errors.append("render.line_width_px doit être entre 1 et 64")
+    sigma = render.get("blur_sigma_px", 4)
+    if not _is_number(sigma) or not 0 <= sigma <= 64:
+        errors.append("render.blur_sigma_px doit être entre 0 et 64")
+    if not _is_number(render.get("color_saturation", 6.0)) or render.get("color_saturation", 6.0) <= 0:
+        errors.append("render.color_saturation doit être > 0")
+    boost = render.get("contrast_boost", 9.0)
+    if not _is_number(boost) or boost < 0:
+        errors.append("render.contrast_boost doit être >= 0 (0 = pas de compression logarithmique)")
+    if not isinstance(gradient, (list, tuple)) or len(gradient) < 2:
+        errors.append("color_gradient doit contenir au moins 2 paliers")
+    else:
+        for stop in gradient:
+            try:
+                ok = (len(stop) == 2 and _is_number(stop[0]) and 0 <= stop[0] <= 1 and len(stop[1]) == 4
+                      and all(_is_number(c) and 0 <= c <= 255 for c in stop[1]))
+            except TypeError:
+                ok = False
+            if not ok:
+                errors.append(f"palier de color_gradient invalide : {stop} (attendu [0-1, [R,G,B,A]] en 0-255)")
+                break
+    if errors:
+        raise ValueError("Configuration invalide : " + " ; ".join(errors))
+
+
+def _make_lut(gradient_stops, n=256):
+    stops = sorted(gradient_stops, key=lambda s: s[0])
+    fracs = np.array([s[0] for s in stops])
+    colors = np.array([s[1] for s in stops], dtype=np.float64)
+    lut = np.zeros((n, 4), dtype=np.uint8)
+    xs = np.linspace(0, 1, n)
+    for c in range(4):
+        lut[:, c] = np.clip(np.interp(xs, fracs, colors[:, c]), 0, 255).astype(np.uint8)
+    return lut
+
+
+@dataclass(frozen=True, eq=False)
+class RenderParams:
+    """Réglages de rendu validés, figés : modifiables à chaud en remplaçant l'objet."""
+    min_zoom: int
+    max_zoom: int
+    line_width_px: int
+    blur_sigma_px: float
+    vmax: float
+    contrast_boost: float
+    lut: np.ndarray
+    pad: int
+
+    @classmethod
+    def from_config(cls, render: dict, gradient) -> "RenderParams":
+        _validate_config(render, gradient)
+        line_width = int(render.get("line_width_px", 3))
+        sigma = float(render.get("blur_sigma_px", 4))
+        return cls(
+            min_zoom=render["min_zoom"],
+            max_zoom=render["max_zoom"],
+            line_width_px=line_width,
+            blur_sigma_px=sigma,
+            vmax=float(render.get("color_saturation", 6.0)),
+            contrast_boost=float(render.get("contrast_boost", 9.0)),
+            lut=_make_lut(gradient),
+            # marge (px) autour de chaque tuile : le trait et le flou débordent jusqu'à cette
+            # distance, on dessine donc sur un canevas élargi pour éviter les coutures aux bords
+            pad=int(math.ceil(line_width / 2 + BLUR_TRUNCATE * sigma)) + 2,
+        )
+
+    def colorize(self, intensity: np.ndarray) -> Image.Image:
+        norm = np.clip(intensity / self.vmax, 0, 1)
+        # compression logarithmique : booste la visibilité des faibles densités (ex: un seul
+        # passage) sans changer color_saturation. Plus contrast_boost est élevé, plus un
+        # passage isolé ressort par rapport à un fond quasi-transparent (0 = linéaire).
+        k = self.contrast_boost
+        if k > 0:
+            norm = np.log1p(norm * k) / np.log1p(k)
+        idx = (norm * 255).astype(np.uint8)
+        return Image.fromarray(self.lut[idx], mode="RGBA")
+
+
+@dataclass(frozen=True, eq=False)
+class Points:
+    """Points en mémoire, triés par segment puis par ordre de passage (les runs d'un
+    même seg_id sont contigus). Jamais modifié en place."""
+    seg: np.ndarray
+    lat: np.ndarray
+    lon: np.ndarray
+
+    @classmethod
+    def empty(cls):
+        return cls(np.empty((0,), dtype=np.int64), np.empty((0,)), np.empty((0,)))
+
+    def __len__(self):
+        return len(self.lat)
 
 
 class HeatmapEngine:
     def __init__(self, config: dict):
-        self.cfg = config
+        self.params = RenderParams.from_config(config["render"], config.get("color_gradient"))
         self.tiles_dir = Path(config["paths"]["tiles"])
         self.db_path = Path(config["paths"]["db"])
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.tiles_dir.mkdir(parents=True, exist_ok=True)
 
-        self.min_zoom = config["render"]["min_zoom"]
-        self.max_zoom = config["render"]["max_zoom"]
-        self.line_width_px = config["render"].get("line_width_px", 3)
-        self.blur_sigma_px = config["render"].get("blur_sigma_px", 4)
-        self.vmax = config["render"].get("color_saturation", 6.0)
-        self.contrast_boost = config["render"].get("contrast_boost", 9.0)
-
+        self._lock = threading.RLock()
+        self._read_lock = threading.Lock()
         self._init_db()
         self._load_points()
-        self._lut = self._make_lut(config["color_gradient"])
+        self._bounds_cache = (None, None)
+        self._tile_count_cache = (0.0, 0)
+
+    def close(self):
+        with self._lock, self._read_lock:
+            self.conn.close()
+            self._read_conn.close()
+
+    def set_render_params(self, render: dict, gradient) -> RenderParams:
+        """Change les réglages de rendu à chaud. Les tuiles existantes ne sont pas
+        recalculées : lancer rerender_all() pour les mettre à jour."""
+        self.params = RenderParams.from_config(render, gradient)
+        return self.params
+
+    # raccourcis (tests, compatibilité)
+    min_zoom = property(lambda self: self.params.min_zoom)
+    max_zoom = property(lambda self: self.params.max_zoom)
+    line_width_px = property(lambda self: self.params.line_width_px)
+    blur_sigma_px = property(lambda self: self.params.blur_sigma_px)
+    pad = property(lambda self: self.params.pad)
+    seg = property(lambda self: self.pts.seg)
+    lat = property(lambda self: self.pts.lat)
+    lon = property(lambda self: self.pts.lon)
+
+    @property
+    def point_count(self) -> int:
+        return len(self.pts)
+
+    def _colorize(self, intensity):
+        return self.params.colorize(intensity)
 
     # ---------- stockage ----------
 
     def _init_db(self):
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS points (seg_id INTEGER, seq INTEGER, lat REAL, lon REAL)"
-        )
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_points_seg ON points(seg_id, seq)"
-        )
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS ingested_files (path TEXT PRIMARY KEY)"
-        )
-        self.conn.commit()
+        c = self.conn
+        c.execute("PRAGMA journal_mode=WAL")  # lectures de l'admin possibles pendant un import
+        c.execute("CREATE TABLE IF NOT EXISTS points (seg_id INTEGER, seq INTEGER, lat REAL, lon REAL)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_points_seg ON points(seg_id, seq)")
+        c.execute("CREATE TABLE IF NOT EXISTS segments (seg_id INTEGER PRIMARY KEY, path TEXT NOT NULL)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_segments_path ON segments(path)")
+        # ok : 1 = importé, 0 = illisible, 2 = importé par une version précédente
+        c.execute("CREATE TABLE IF NOT EXISTS ingested_files (path TEXT PRIMARY KEY, mtime REAL, size INTEGER, "
+                  "ok INTEGER NOT NULL DEFAULT 1, points INTEGER, imported_at REAL, error TEXT)")
+
+        # migration des bases créées par les versions précédentes
+        cols = {row[1] for row in c.execute("PRAGMA table_info(ingested_files)")}
+        if "mtime" not in cols:
+            # fichiers identifiés par leur seul chemin, sans signature ni lien vers leurs segments
+            c.execute("ALTER TABLE ingested_files ADD COLUMN mtime REAL")
+            c.execute("ALTER TABLE ingested_files ADD COLUMN size INTEGER")
+            c.execute("ALTER TABLE ingested_files ADD COLUMN ok INTEGER NOT NULL DEFAULT 2")
+            legacy = [r[0] for r in c.execute("SELECT path FROM ingested_files")]
+            for path in legacy:
+                sig = _file_signature(path)
+                if sig is not None:
+                    c.execute("UPDATE ingested_files SET mtime=?, size=? WHERE path=?", (*sig, path))
+            if legacy:
+                log.info("Base migrée : %d fichier(s) importé(s) par une version précédente. "
+                         "Une réindexation permet de gérer aussi leur suppression/modification.",
+                         len(legacy))
+        for col, ddl in (("points", "INTEGER"), ("imported_at", "REAL"), ("error", "TEXT")):
+            if col not in cols:
+                c.execute(f"ALTER TABLE ingested_files ADD COLUMN {col} {ddl}")
+        c.commit()
+        self._read_conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
 
     def _load_points(self):
-        cur = self.conn.execute("SELECT seg_id, seq, lat, lon FROM points ORDER BY seg_id, seq")
-        rows = cur.fetchall()
+        rows = self.conn.execute("SELECT seg_id, lat, lon FROM points ORDER BY seg_id, seq").fetchall()
         if rows:
             arr = np.array(rows, dtype=np.float64)
-            self.seg = arr[:, 0].astype(np.int64)
-            self.seq = arr[:, 1].astype(np.int64)
-            self.lat = arr[:, 2]
-            self.lon = arr[:, 3]
+            self.pts = Points(arr[:, 0].astype(np.int64), arr[:, 1], arr[:, 2])
         else:
-            self.seg = np.empty((0,), dtype=np.int64)
-            self.seq = np.empty((0,), dtype=np.int64)
-            self.lat = np.empty((0,), dtype=np.float64)
-            self.lon = np.empty((0,), dtype=np.float64)
-        self._next_seg_id = int(self.seg.max()) + 1 if len(self.seg) else 0
+            self.pts = Points.empty()
+        max_seg = self.conn.execute(
+            "SELECT MAX(m) FROM (SELECT MAX(seg_id) AS m FROM points UNION ALL SELECT MAX(seg_id) FROM segments)"
+        ).fetchone()[0]
+        self._next_seg_id = int(max_seg) + 1 if max_seg is not None else 0
 
-    def already_ingested(self, path: str) -> bool:
-        cur = self.conn.execute("SELECT 1 FROM ingested_files WHERE path=?", (path,))
-        return cur.fetchone() is not None
+    def _file_row(self, path):
+        return self.conn.execute("SELECT mtime, size, ok FROM ingested_files WHERE path=?", (path,)).fetchone()
 
-    # ---------- ingestion ----------
+    def _is_up_to_date(self, path, sig) -> bool:
+        row = self._file_row(path)
+        if row is None:
+            return False
+        if row[0] is None:
+            return True  # importé par une ancienne version, fichier introuvable lors de la migration
+        return (row[0], row[1]) == tuple(sig)
 
-    def ingest_gpx(self, path: str):
-        if self.already_ingested(path):
-            return
+    def needs_ingest(self, path) -> bool:
+        """True si le fichier existe et n'a jamais été importé, ou a changé depuis."""
+        path = normalize_path(path)
+        sig = _file_signature(path)
+        if sig is None:
+            return False
+        with self._lock:
+            return not self._is_up_to_date(path, sig)
 
-        try:
-            segments, waypoints = gpx_utils.parse_gpx_segments(path)
-        except Exception:
-            log.exception("GPX illisible/invalide, ignoré : %s", path)
-            self.conn.execute("INSERT OR IGNORE INTO ingested_files(path) VALUES (?)", (path,))
-            self.conn.commit()
-            return
+    # ---------- ingestion / suppression ----------
 
-        rows = []  # (seg_id, seq, lat, lon)
-        for seg_pts in segments:
-            sid = self._next_seg_id
-            self._next_seg_id += 1
-            for i, (lat, lon) in enumerate(seg_pts):
-                rows.append((sid, i, lat, lon))
-        for lat, lon in waypoints:
-            sid = self._next_seg_id
-            self._next_seg_id += 1
-            rows.append((sid, 0, lat, lon))
+    def ingest_gpx(self, path: str) -> int:
+        return self.bulk_ingest([path])
 
-        if not rows:
-            self.conn.execute("INSERT OR IGNORE INTO ingested_files(path) VALUES (?)", (path,))
-            self.conn.commit()
-            return
+    def bulk_ingest(self, paths, render: bool = True, force: bool = False, progress=NULL_PROGRESS) -> int:
+        """Importe les fichiers nouveaux ou modifiés parmi `paths` (tous avec force=True) :
+        tout est inséré en base avant de calculer quoi que ce soit, puis chaque tuile impactée
+        n'est rendue qu'UNE seule fois pour l'ensemble du lot. Un fichier modifié depuis son
+        import voit ses anciens points remplacés. Retourne le nombre de fichiers traités."""
+        with self._lock:
+            todo = []
+            for path in dict.fromkeys(normalize_path(p) for p in paths):
+                sig = _file_signature(path)
+                if sig is not None and (force or not self._is_up_to_date(path, sig)):
+                    todo.append((path, sig))
+            if not todo:
+                return 0
 
-        with _lock:
+            progress.phase("Lecture des GPX", len(todo))
+            parsed = []  # (chemin, signature, segments ou None, erreur)
+            for path, sig in todo:
+                try:
+                    segments, waypoints = gpx_utils.parse_gpx_segments(path)
+                    parsed.append((path, sig, segments + [[wp] for wp in waypoints], None))
+                except Exception as e:
+                    log.exception("GPX illisible/invalide, ignoré : %s", path)
+                    parsed.append((path, sig, None, str(e) or e.__class__.__name__))
+                progress.advance()
+            # rien n'a été modifié jusqu'ici : une annulation pendant la lecture laisse tout intact
+
+            changed = [p for p, _ in todo if self._file_row(p) is not None]
+            old = self._remove_from_store(changed)
+
+            rows, seg_rows, file_rows = [], [], []
+            now = time.time()
+            for path, sig, segments, error in parsed:
+                if segments is None:
+                    # mémorisé avec sa signature : ne sera retenté que si le fichier change
+                    # (ex : copie encore en cours au moment de la lecture)
+                    file_rows.append((path, *sig, 0, None, now, error[:500]))
+                    continue
+                n_points = 0
+                for pts in segments:
+                    sid = self._next_seg_id
+                    self._next_seg_id += 1
+                    seg_rows.append((sid, path))
+                    rows.extend((sid, i, lat, lon) for i, (lat, lon) in enumerate(pts))
+                    n_points += len(pts)
+                file_rows.append((path, *sig, 1, n_points, now, None))
+
+            failed = sum(1 for p in parsed if p[2] is None)
+            if failed:
+                log.warning("%d fichier(s) GPX invalide(s) ignoré(s) lors de cet import", failed)
+
+            self.conn.executemany("INSERT INTO points(seg_id, seq, lat, lon) VALUES (?,?,?,?)", rows)
+            self.conn.executemany("INSERT INTO segments(seg_id, path) VALUES (?,?)", seg_rows)
             self.conn.executemany(
-                "INSERT INTO points(seg_id, seq, lat, lon) VALUES (?,?,?,?)", rows
+                "INSERT OR REPLACE INTO ingested_files(path, mtime, size, ok, points, imported_at, error) "
+                "VALUES (?,?,?,?,?,?,?)", file_rows
             )
-            self.conn.execute("INSERT OR IGNORE INTO ingested_files(path) VALUES (?)", (path,))
             self.conn.commit()
 
-            arr = np.array(rows, dtype=np.float64)
-            new_seg = arr[:, 0].astype(np.int64)
-            new_lat = arr[:, 2]
-            new_lon = arr[:, 3]
+            if rows:
+                arr = np.array(rows, dtype=np.float64)
+                new = Points(arr[:, 0].astype(np.int64), arr[:, 2], arr[:, 3])
+                self.pts = Points(np.concatenate([self.pts.seg, new.seg]),
+                                  np.concatenate([self.pts.lat, new.lat]),
+                                  np.concatenate([self.pts.lon, new.lon]))
+            else:
+                new = Points.empty()
 
-            self.seg = np.concatenate([self.seg, new_seg])
-            self.seq = np.concatenate([self.seq, arr[:, 1].astype(np.int64)])
-            self.lat = np.concatenate([self.lat, new_lat])
-            self.lon = np.concatenate([self.lon, new_lon])
-
-            self._rerender_affected(new_lat, new_lon, new_seg)
-
-    def rerender_all(self):
-        """Recalcule toutes les tuiles à partir de zéro (après un changement de style/config).
-        Vide d'abord entièrement le dossier des tuiles (au cas où la plage de zoom ou la
-        zone couverte aurait changé depuis le dernier rendu), avant de tout regénérer."""
-        import shutil
-        with _lock:
-            shutil.rmtree(self.tiles_dir, ignore_errors=True)
-            self.tiles_dir.mkdir(parents=True, exist_ok=True)
-            if len(self.lat) == 0:
-                return
-            self._rerender_affected(self.lat, self.lon, self.seg)
-
-    def bulk_ingest(self, paths):
-        """Import groupé : insère TOUS les fichiers en base avant de calculer quoi que ce soit,
-        puis ne rend chaque tuile impactée qu'UNE seule fois pour l'ensemble du lot, au lieu de
-        la redessiner à chaque fichier. Très largement plus rapide pour un import initial massif
-        (ex: des centaines de GPX d'un coup) que d'appeler ingest_gpx() en boucle."""
-        rows = []
-        newly_ingested_paths = []
-        skipped = 0
-        for path in paths:
-            if self.already_ingested(path):
-                continue
-            try:
-                segments, waypoints = gpx_utils.parse_gpx_segments(path)
-            except Exception:
-                log.exception("GPX illisible/invalide, ignoré : %s", path)
-                newly_ingested_paths.append(path)  # marqué comme traité pour ne pas le retenter en boucle
-                skipped += 1
-                continue
-            for seg_pts in segments:
-                sid = self._next_seg_id
-                self._next_seg_id += 1
-                for i, (lat, lon) in enumerate(seg_pts):
-                    rows.append((sid, i, lat, lon))
-            for lat, lon in waypoints:
-                sid = self._next_seg_id
-                self._next_seg_id += 1
-                rows.append((sid, 0, lat, lon))
-            newly_ingested_paths.append(path)
-
-        if skipped:
-            log.warning("%d fichier(s) GPX invalide(s) ignoré(s) lors de cet import groupé", skipped)
-
-        if not rows:
-            with _lock:
-                self.conn.executemany(
-                    "INSERT OR IGNORE INTO ingested_files(path) VALUES (?)",
-                    [(p,) for p in newly_ingested_paths],
+            if render:
+                # une seule passe de rendu pour les anciens points retirés ET les nouveaux
+                self._rerender_affected(
+                    np.concatenate([old.lat, new.lat]),
+                    np.concatenate([old.lon, new.lon]),
+                    np.concatenate([old.seg, new.seg]),
+                    progress,
                 )
-                self.conn.commit()
-            return
+            return len(todo)
 
-        with _lock:
-            self.conn.executemany(
-                "INSERT INTO points(seg_id, seq, lat, lon) VALUES (?,?,?,?)", rows
-            )
-            self.conn.executemany(
-                "INSERT OR IGNORE INTO ingested_files(path) VALUES (?)",
-                [(p,) for p in newly_ingested_paths],
-            )
+    def remove_files(self, paths, progress=NULL_PROGRESS) -> int:
+        """Retire de la heatmap les points des fichiers donnés (fichiers supprimés)."""
+        with self._lock:
+            paths = [p for p in dict.fromkeys(normalize_path(p) for p in paths) if self._file_row(p) is not None]
+            if not paths:
+                return 0
+            removed = self._remove_from_store(paths)
             self.conn.commit()
+            self._rerender_affected(removed.lat, removed.lon, removed.seg, progress)
+            return len(paths)
 
-            arr = np.array(rows, dtype=np.float64)
-            new_seg = arr[:, 0].astype(np.int64)
-            new_lat = arr[:, 2]
-            new_lon = arr[:, 3]
+    def _remove_from_store(self, paths) -> Points:
+        """Supprime les fichiers de la base (sans commit) et leurs points de la mémoire.
+        Retourne les points retirés, pour recalculer leurs tuiles."""
+        seg_ids = []
+        for path in paths:
+            ids = [r[0] for r in self.conn.execute("SELECT seg_id FROM segments WHERE path=?", (path,))]
+            row = self._file_row(path)
+            if row is not None and row[2] == 2:
+                log.warning("%s : importé par une version précédente, ses anciens points restent "
+                            "affichés jusqu'à une réindexation", path)
+            seg_ids.extend(ids)
+        self.conn.executemany("DELETE FROM points WHERE seg_id=?", [(s,) for s in seg_ids])
+        self.conn.executemany("DELETE FROM segments WHERE path=?", [(p,) for p in paths])
+        self.conn.executemany("DELETE FROM ingested_files WHERE path=?", [(p,) for p in paths])
 
-            self.seg = np.concatenate([self.seg, new_seg])
-            self.seq = np.concatenate([self.seq, arr[:, 1].astype(np.int64)])
-            self.lat = np.concatenate([self.lat, new_lat])
-            self.lon = np.concatenate([self.lon, new_lon])
+        if not seg_ids:
+            return Points.empty()
+        pts = self.pts
+        mask = np.isin(pts.seg, np.array(seg_ids, dtype=np.int64))
+        keep = ~mask
+        self.pts = Points(pts.seg[keep], pts.lat[keep], pts.lon[keep])
+        return Points(pts.seg[mask], pts.lat[mask], pts.lon[mask])
 
-            # une seule passe de rendu sur l'ensemble des tuiles impactées par TOUT le lot
-            self._rerender_affected(new_lat, new_lon, new_seg)
+    def sync_folder(self, folder, progress=NULL_PROGRESS) -> dict:
+        """Aligne la base sur le contenu du dossier : importe en un seul lot les .gpx
+        nouveaux ou modifiés, et retire ceux qui ont disparu (ex : supprimés pendant que
+        le service était arrêté)."""
+        folder = normalize_path(folder)
+        if not os.path.isdir(folder):
+            # surtout ne pas le traiter comme vide : un partage réseau non monté
+            # effacerait toute la heatmap
+            log.warning("Dossier %s introuvable, synchronisation ignorée", folder)
+            return {"imported": 0, "removed": 0}
+        progress.phase("Analyse du dossier")
+        present = _list_gpx(folder)
+        with self._lock:
+            known = [r[0] for r in self.conn.execute("SELECT path FROM ingested_files")]
+            gone = [p for p in known if os.path.dirname(p) == folder and not os.path.exists(p)]
+            removed = self.remove_files(gone, progress) if gone else 0
+            imported = self.bulk_ingest(present, progress=progress)
+        return {"imported": imported, "removed": removed}
+
+    def reindex(self, folder, progress=NULL_PROGRESS) -> dict:
+        """Vide entièrement la base et réimporte tout le dossier, puis recalcule toutes les
+        tuiles. Utile pour une base créée par une version précédente (doublons possibles,
+        suppression de fichiers non gérée)."""
+        with self._lock:
+            progress.phase("Vidage de la base")
+            for table in ("points", "segments", "ingested_files"):
+                self.conn.execute(f"DELETE FROM {table}")
+            self.conn.commit()
+            self.conn.execute("VACUUM")
+            self._load_points()
+            imported = self.bulk_ingest(_list_gpx(folder), render=False, progress=progress)
+            self.rerender_all(progress)
+        return {"imported": imported}
 
     # ---------- rendu ----------
 
-    def _rerender_affected(self, lat_new, lon_new, seg_new):
+    def rerender_all(self, progress=NULL_PROGRESS):
+        """Recalcule toutes les tuiles (après un changement de style/config). Les tuiles
+        existantes restent servies pendant le calcul (remplacement atomique) ; celles qui
+        n'ont plus lieu d'être (zone vide, zoom hors plage) sont supprimées à la fin."""
+        with self._lock:
+            pts = self.pts
+            written = self._rerender_affected(pts.lat, pts.lon, pts.seg, progress)
+            progress.phase("Nettoyage des tuiles obsolètes")
+            for f in list(self.tiles_dir.rglob("*")):
+                if not f.is_file():
+                    continue
+                try:
+                    key = (int(f.parent.parent.name), int(f.parent.name), int(f.name.split(".")[0]))
+                except ValueError:
+                    key = None
+                if f.suffix != ".png" or key not in written:
+                    f.unlink(missing_ok=True)
+            for d in sorted((d for d in self.tiles_dir.rglob("*") if d.is_dir()), reverse=True):
+                if not any(d.iterdir()):
+                    d.rmdir()
+            self._tile_count_cache = (0.0, 0)
+
+    @staticmethod
+    def _buffer_deg(params, z):
+        # marge en degrés de longitude ; appliquée aussi à la latitude, ce qui la majore
+        # (en Mercator, un pixel couvre moins de degrés de latitude que de longitude)
+        return 360.0 / (2 ** z * TILE_SIZE) * params.pad
+
+    @classmethod
+    def _canvas_bounds(cls, params, z, x, y):
+        b = mercantile.bounds(x, y, z)
+        buf = cls._buffer_deg(params, z)
+        return b.west - buf, b.south - buf, b.east + buf, b.north + buf
+
+    def _rerender_affected(self, lat_new, lon_new, seg_new, progress=NULL_PROGRESS):
         """Calcule l'ensemble des tuiles à (re)générer comme l'UNION des empreintes de
         chaque trace individuelle (pas la bbox globale du lot). Important pour un import
         groupé de traces géographiquement dispersées (ex: plusieurs pays) : une bbox
         globale engloberait d'immenses zones vides et ferait exploser le nombre de
-        tuiles à haut zoom."""
+        tuiles à haut zoom. Retourne l'ensemble des tuiles écrites (non vides)."""
         if len(seg_new) == 0:
-            return
+            return set()
+        params = self.params
 
         # les tableaux sont dans l'ordre d'insertion (par seg_id croissant) -> les runs
         # d'un même seg_id sont contigus, pas besoin de trier
-        change_idx = np.where(np.diff(seg_new) != 0)[0] + 1
-        groups = np.split(np.arange(len(seg_new)), change_idx)
+        starts = np.concatenate([[0], np.flatnonzero(np.diff(seg_new)) + 1])
+        bboxes = list(zip(
+            np.minimum.reduceat(lon_new, starts), np.minimum.reduceat(lat_new, starts),
+            np.maximum.reduceat(lon_new, starts), np.maximum.reduceat(lat_new, starts),
+        ))
 
-        tiles_by_zoom = set()
-        for z in range(self.min_zoom, self.max_zoom + 1):
-            deg_per_px = 360.0 / (2 ** z * 256)
-            margin_px = self.line_width_px + 3 * self.blur_sigma_px + PAD
-            buffer_deg = deg_per_px * margin_px
-
-            for g in groups:
-                if len(g) == 0:
-                    continue
-                lat_g = lat_new[g]
-                lon_g = lon_new[g]
-                west, east = float(np.min(lon_g)), float(np.max(lon_g))
-                south, north = float(np.min(lat_g)), float(np.max(lat_g))
-
-                w, s, e, n = west - buffer_deg, south - buffer_deg, east + buffer_deg, north + buffer_deg
-                w, e = max(w, -180), min(e, 180)
-                s, n = max(s, -85.05), min(n, 85.05)
-
+        progress.phase("Recherche des tuiles", params.max_zoom - params.min_zoom + 1)
+        tiles = set()
+        for z in range(params.min_zoom, params.max_zoom + 1):
+            buf = self._buffer_deg(params, z)
+            for west, south, east, north in bboxes:
+                w, e = max(west - buf, -180), min(east + buf, 180)
+                s, n = max(south - buf, -MAX_LAT), min(north + buf, MAX_LAT)
                 for tile in mercantile.tiles(w, s, e, n, [z]):
-                    tiles_by_zoom.add((z, tile.x, tile.y))
+                    tiles.add((z, tile.x, tile.y))
+            progress.advance()
+        return self._render_tiles(tiles, params, progress)
 
-        for z, x, y in tiles_by_zoom:
-            self._render_tile(z, x, y)
+    def _render_tiles(self, tiles, params, progress=NULL_PROGRESS):
+        """Rend les tuiles en ne filtrant le jeu complet de points qu'une fois par tuile
+        parente (au zoom minimal) : chaque tuile ne teste ensuite que les points de sa
+        région, au lieu de parcourir tous les points à chaque fois."""
+        progress.phase("Calcul des tuiles", len(tiles))
+        pts = self.pts
+        zp = params.min_zoom
+        by_parent = defaultdict(list)
+        for z, x, y in tiles:
+            by_parent[(x >> (z - zp), y >> (z - zp))].append((z, x, y))
 
-    def _render_tile(self, z, x, y):
-        deg_per_px = 360.0 / (2 ** z * 256)
-        margin_px = self.line_width_px + 3 * self.blur_sigma_px + PAD
-        buf = deg_per_px * margin_px
-        bounds = mercantile.bounds(x, y, z)
-        w, s, e, n = bounds.west - buf, bounds.south - buf, bounds.east + buf, bounds.north + buf
+        all_idx = np.arange(len(pts))
+        written = set()
+        for (px, py), children in by_parent.items():
+            candidates = self._select(pts, all_idx, *self._canvas_bounds(params, zp, px, py))
+            for z, x, y in children:
+                out = self.tile_path(z, x, y)
+                img = self._tile_image(pts, params, z, x, y, candidates)
+                if img is None:
+                    out.unlink(missing_ok=True)
+                else:
+                    self._write_tile(out, img)
+                    written.add((z, x, y))
+                progress.advance()
+        return written
 
-        mask = (self.lon >= w) & (self.lon <= e) & (self.lat >= s) & (self.lat <= n)
-        if not np.any(mask):
-            out = self.tiles_dir / str(z) / str(x) / f"{y}.png"
-            if out.exists():
-                out.unlink()
+    @staticmethod
+    def _select(pts, idx, w, s, e, n):
+        """Sous-ensemble (trié) des indices `idx` nécessaires pour dessiner la zone donnée :
+        les points qui s'y trouvent, plus les deux extrémités de tout tronçon dont la bbox
+        la recoupe. Sans ce dernier cas, un tronçon qui traverse la zone sans y avoir de
+        point (points espacés, route planifiée, fort zoom) n'y serait pas dessiné."""
+        if len(idx) == 0:
+            return idx
+        lon, lat = pts.lon[idx], pts.lat[idx]
+        keep = (lon >= w) & (lon <= e) & (lat >= s) & (lat <= n)
+        if len(idx) >= 2:
+            linked = (idx[1:] == idx[:-1] + 1) & (pts.seg[idx[1:]] == pts.seg[idx[:-1]])
+            crossing = (
+                linked
+                & (np.minimum(lon[:-1], lon[1:]) <= e) & (np.maximum(lon[:-1], lon[1:]) >= w)
+                & (np.minimum(lat[:-1], lat[1:]) <= n) & (np.maximum(lat[:-1], lat[1:]) >= s)
+            )
+            keep[:-1] |= crossing
+            keep[1:] |= crossing
+        return idx[keep]
+
+    def _tile_image(self, pts, params, z, x, y, candidates):
+        """Image RGBA d'une tuile, ou None si aucune trace ne la touche."""
+        idx = self._select(pts, candidates, *self._canvas_bounds(params, z, x, y))
+        if len(idx) == 0:
+            return None
+
+        pad = params.pad
+        canvas_size = TILE_SIZE + 2 * pad
+        canvas = np.zeros((canvas_size, canvas_size), dtype=np.float32)
+        px, py = self._lonlat_to_pixel(pts.lon[idx], pts.lat[idx], z)
+        lx = px - (x * TILE_SIZE - pad)
+        ly = py - (y * TILE_SIZE - pad)
+
+        seg_starts = np.flatnonzero(np.diff(pts.seg[idx])) + 1
+        for g in np.split(np.arange(len(idx)), seg_starts):
+            # portions continues du segment : un trou dans les indices veut dire que la
+            # trace est sortie de la zone de cette tuile puis y est revenue plus tard
+            # (boucle, aller-retour...) : il ne faut PAS relier ces deux portions, sous
+            # peine de créer une fausse ligne droite
+            runs = np.split(g, np.flatnonzero(np.diff(idx[g]) != 1) + 1)
+            self._draw_segment(canvas, [(lx[r], ly[r]) for r in runs], params.line_width_px)
+
+        if params.blur_sigma_px > 0:
+            canvas = ndimage.gaussian_filter(canvas, sigma=params.blur_sigma_px, truncate=BLUR_TRUNCATE)
+        return params.colorize(canvas[pad:pad + TILE_SIZE, pad:pad + TILE_SIZE])
+
+    @staticmethod
+    def _draw_segment(canvas, runs, line_width):
+        """Ajoute un segment (liste de portions (xs, ys)) au canevas. Toutes ses portions
+        sont dessinées sur la même image avant d'être ajoutées : une trace ne contribue
+        jamais plus d'1 "unité" à un pixel, même si elle se recoupe (aller-retour) ->
+        un passage = un passage. Le dessin se fait sur la seule zone englobante."""
+        size = canvas.shape[0]
+        r = line_width / 2 + 1
+        x0 = max(int(math.floor(min(xs.min() for xs, _ in runs) - r)), 0)
+        y0 = max(int(math.floor(min(ys.min() for _, ys in runs) - r)), 0)
+        x1 = min(int(math.ceil(max(xs.max() for xs, _ in runs) + r)) + 1, size)
+        y1 = min(int(math.ceil(max(ys.max() for _, ys in runs) + r)) + 1, size)
+        if x0 >= x1 or y0 >= y1:
             return
 
-        lat_sel = self.lat[mask]
-        lon_sel = self.lon[mask]
-        seg_sel = self.seg[mask]
-        seq_sel = self.seq[mask]
-
-        size = 256
-        canvas_size = size + 2 * PAD
-        canvas = np.zeros((canvas_size, canvas_size), dtype=np.float32)
-        origin_x = x * 256 - PAD
-        origin_y = y * 256 - PAD
-
-        px_all, py_all = self._lonlat_to_pixel(lon_sel, lat_sel, z)
-        lx_all = px_all - origin_x
-        ly_all = py_all - origin_y
-
-        # regroupe les points contigus par segment (les tableaux sont triés par seg_id, seq :
-        # le masque de bbox préserve cet ordre, donc les runs restent contigus)
-        change_idx = np.where(np.diff(seg_sel) != 0)[0] + 1
-        seg_groups = np.split(np.arange(len(seg_sel)), change_idx)
-
-        # à l'intérieur d'un même segment, un saut dans "seq" veut dire que la trace est
-        # sortie de la zone visible de cette tuile puis y est revenue plus tard (boucle,
-        # aller-retour...) : il ne faut PAS relier ces deux portions par une ligne, sous
-        # peine de créer une fausse ligne droite qui ne correspond à aucune trace réelle.
-        groups = []
-        for g in seg_groups:
-            if len(g) <= 1:
-                groups.append(g)
-                continue
-            seq_g = seq_sel[g]
-            gap_idx = np.where(np.diff(seq_g) != 1)[0] + 1
-            groups.extend(np.split(g, gap_idx))
-
-        for g in groups:
-            if len(g) == 0:
-                continue
-            xs = lx_all[g]
-            ys = ly_all[g]
-
-            temp = Image.new("L", (canvas_size, canvas_size), 0)
-            draw = ImageDraw.Draw(temp)
-            if len(g) == 1:
-                r = self.line_width_px / 2
-                draw.ellipse([xs[0] - r, ys[0] - r, xs[0] + r, ys[0] + r], fill=255)
+        temp = Image.new("L", (x1 - x0, y1 - y0), 0)
+        draw = ImageDraw.Draw(temp)
+        for xs, ys in runs:
+            if len(xs) == 1:
+                cx, cy, rr = xs[0] - x0, ys[0] - y0, line_width / 2
+                draw.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=255)
             else:
-                coords = list(zip(xs.tolist(), ys.tolist()))
-                draw.line(coords, fill=255, width=self.line_width_px, joint="curve")
+                coords = list(zip((xs - x0).tolist(), (ys - y0).tolist()))
+                draw.line(coords, fill=255, width=line_width, joint="curve")
+        canvas[y0:y1, x0:x1] += np.asarray(temp) > 0
 
-            # une trace ne contribue jamais plus d'1 "unité" à un pixel, même si
-            # elle se recoupe elle-même (aller-retour) -> un passage = un passage
-            canvas += (np.asarray(temp, dtype=np.float32) > 0).astype(np.float32)
+    def render_preview(self, z, x, y, params: RenderParams):
+        """PNG d'une tuile rendue avec des réglages candidats, sans rien écrire (aperçu de
+        l'admin). Ne prend pas le verrou : utilisable pendant un import."""
+        pts = self.pts
+        if not params.min_zoom <= z <= params.max_zoom or not len(pts):
+            return None
+        img = self._tile_image(pts, params, z, x, y, np.arange(len(pts)))
+        if img is None:
+            return None
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
 
-        if self.blur_sigma_px > 0:
-            canvas = ndimage.gaussian_filter(canvas, sigma=self.blur_sigma_px)
-
-        cropped = canvas[PAD:PAD + size, PAD:PAD + size]
-        img = self._colorize(cropped)
-
-        out_dir = self.tiles_dir / str(z) / str(x)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        img.save(out_dir / f"{y}.png", format="PNG", optimize=True)
+    def tile_path(self, z, x, y) -> Path:
+        return self.tiles_dir / str(z) / str(x) / f"{y}.png"
 
     def get_tile_path(self, z, x, y):
-        p = self.tiles_dir / str(z) / str(x) / f"{y}.png"
+        p = self.tile_path(z, x, y)
         return p if p.exists() else None
 
-    # ---------- maths / rendu bas niveau ----------
+    @staticmethod
+    def _write_tile(path: Path, img: Image.Image):
+        # écriture dans un fichier temporaire puis renommage atomique : une requête
+        # concurrente lit l'ancienne ou la nouvelle tuile, jamais une tuile à moitié écrite
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        img.save(tmp, format="PNG", optimize=True)
+        os.replace(tmp, path)
 
     @staticmethod
     def _lonlat_to_pixel(lon, lat, zoom):
-        lat_rad = np.radians(lat)
+        lat_rad = np.radians(np.clip(lat, -MAX_LAT, MAX_LAT))
         n = 2 ** zoom
-        x = (lon + 180.0) / 360.0 * n * 256
-        y = (1.0 - np.log(np.tan(lat_rad) + 1.0 / np.cos(lat_rad)) / math.pi) / 2.0 * n * 256
+        x = (lon + 180.0) / 360.0 * n * TILE_SIZE
+        y = (1.0 - np.log(np.tan(lat_rad) + 1.0 / np.cos(lat_rad)) / math.pi) / 2.0 * n * TILE_SIZE
         return x, y
 
-    @staticmethod
-    def _make_lut(gradient_stops, n=256):
-        stops = sorted(gradient_stops, key=lambda s: s[0])
-        fracs = np.array([s[0] for s in stops])
-        colors = np.array([s[1] for s in stops], dtype=np.float64)
-        lut = np.zeros((n, 4), dtype=np.uint8)
-        xs = np.linspace(0, 1, n)
-        for c in range(4):
-            lut[:, c] = np.clip(np.interp(xs, fracs, colors[:, c]), 0, 255).astype(np.uint8)
-        return lut
+    # ---------- consultation (admin) ----------
 
-    def _colorize(self, intensity: np.ndarray) -> Image.Image:
-        norm = np.clip(intensity / self.vmax, 0, 1)
-        # compression logarithmique : booste la visibilité des faibles densités (ex: un seul
-        # passage) sans changer color_saturation. Plus contrast_boost est élevé, plus un
-        # passage isolé ressort par rapport à un fond quasi-transparent.
-        k = self.contrast_boost
-        norm = np.log1p(norm * k) / np.log1p(k)
-        idx = (norm * 255).astype(np.uint8)
-        rgba = self._lut[idx]
-        return Image.fromarray(rgba, mode="RGBA")
+    def _read(self, sql, args=()):
+        with self._read_lock:
+            return self._read_conn.execute(sql, args).fetchall()
+
+    def stats(self) -> dict:
+        by_status = dict(self._read("SELECT ok, COUNT(*) FROM ingested_files GROUP BY ok"))
+        return {
+            "files": sum(by_status.values()),
+            "files_ok": by_status.get(1, 0),
+            "files_failed": by_status.get(0, 0),
+            "files_legacy": by_status.get(2, 0),
+            "segments": self._read("SELECT COUNT(*) FROM segments")[0][0],
+            "points": self.point_count,
+            "tiles": self.tile_count(),
+            "data_bounds": self.data_bounds(),
+        }
+
+    def tile_count(self, max_age=30.0) -> int:
+        at, count = self._tile_count_cache
+        if time.monotonic() - at > max_age:
+            count = sum(1 for _ in self.tiles_dir.rglob("*.png"))
+            self._tile_count_cache = (time.monotonic(), count)
+        return count
+
+    def data_bounds(self):
+        """[ouest, sud, est, nord] de l'essentiel des points (centiles 0,5-99,5 % pour
+        ignorer les points GPS aberrants), ou None sans données."""
+        pts = self.pts
+        key, bounds = self._bounds_cache
+        if key is pts:
+            return bounds
+        bounds = None
+        if len(pts):
+            lo_lon, hi_lon = np.percentile(pts.lon, [0.5, 99.5])
+            lo_lat, hi_lat = np.percentile(pts.lat, [0.5, 99.5])
+            bounds = [float(lo_lon), float(lo_lat), float(hi_lon), float(hi_lat)]
+        self._bounds_cache = (pts, bounds)
+        return bounds
+
+    def list_files(self, query="", status="all", offset=0, limit=50) -> dict:
+        where, args = [], []
+        if query:
+            where.append("path LIKE ?")
+            args.append(f"%{query}%")
+        codes = {v: k for k, v in FILE_STATUS.items()}
+        if status in codes:
+            where.append("ok = ?")
+            args.append(codes[status])
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        total = self._read(f"SELECT COUNT(*) FROM ingested_files {clause}", args)[0][0]
+        rows = self._read(
+            f"SELECT path, ok, points, size, mtime, imported_at, error FROM ingested_files {clause} "
+            "ORDER BY imported_at IS NULL, imported_at DESC, path LIMIT ? OFFSET ?",
+            args + [limit, offset],
+        )
+        return {
+            "total": total,
+            "items": [
+                {"path": p, "name": os.path.basename(p), "status": FILE_STATUS.get(ok, "ok"), "points": pts,
+                 "size": size, "mtime": mtime, "imported_at": at, "error": err}
+                for p, ok, pts, size, mtime, at, err in rows
+            ],
+        }
+
+    def failed_files(self):
+        return [r[0] for r in self._read("SELECT path FROM ingested_files WHERE ok = 0")]

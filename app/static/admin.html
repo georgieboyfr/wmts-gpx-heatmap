@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Heatmap GPX — Admin</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="/admin/static/admin.css">
+</head>
+<body>
+
+<!-- ===== Connexion ===== -->
+<section id="login-view" class="login-view" hidden>
+  <form id="login-form" class="card login-card">
+    <h1>Heatmap GPX</h1>
+    <p class="muted">Administration</p>
+    <div id="login-disabled" class="notice warn" hidden>
+      L'administration est désactivée : définis <code>ADMIN_TOKEN</code> dans le fichier <code>.env</code>
+      puis redémarre le conteneur.
+    </div>
+    <label class="field">
+      <span>Jeton d'administration</span>
+      <input id="login-token" type="password" autocomplete="current-password" required>
+    </label>
+    <p id="login-error" class="error-text" hidden></p>
+    <button class="btn primary" type="submit">Se connecter</button>
+  </form>
+</section>
+
+<!-- ===== Application ===== -->
+<div id="app" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <strong>Heatmap GPX</strong>
+        <span class="muted small" id="service-line">—</span>
+      </div>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="dashboard" class="active">Tableau de bord</button>
+      <button role="tab" data-tab="garmin">Garmin <span id="garmin-tab-dot" class="dot"></span></button>
+      <button role="tab" data-tab="data">Données</button>
+      <button role="tab" data-tab="render">Rendu</button>
+      <button role="tab" data-tab="logs">Journal</button>
+    </nav>
+    <div class="topbar-actions">
+      <a id="caps-link" class="btn ghost small" target="_blank" rel="noopener">GetCapabilities</a>
+      <button id="logout-btn" class="btn ghost small">Déconnexion</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- ----- Tableau de bord ----- -->
+    <section class="tab-panel" data-panel="dashboard">
+      <div class="stats-grid" id="stats-grid"></div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h2>Actions</h2>
+          <div class="actions-list">
+            <div class="action-row">
+              <div><strong>Rescanner le dossier</strong>
+                <p class="muted small">Importe les GPX nouveaux ou modifiés, retire ceux qui ont été supprimés.</p></div>
+              <button class="btn" data-action="rescan">Rescanner</button>
+            </div>
+            <div class="action-row">
+              <div><strong>Recalculer les tuiles</strong>
+                <p class="muted small">Regénère toutes les tuiles avec les réglages de rendu actuels.</p></div>
+              <button class="btn" data-action="rerender">Recalculer</button>
+            </div>
+            <div class="action-row">
+              <div><strong>Synchroniser Garmin</strong>
+                <p class="muted small">Récupère tout de suite les nouvelles activités.</p></div>
+              <button class="btn" data-action="garmin-sync">Synchroniser</button>
+            </div>
+            <div class="action-row">
+              <div><strong>Réindexer tout</strong>
+                <p class="muted small">Vide la base, réimporte tout le dossier et recalcule toutes les tuiles.</p></div>
+              <button class="btn danger" data-action="reindex">Réindexer</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Garmin Connect</h2>
+          <div id="dash-garmin-info"></div>
+          <div id="dash-garmin-actions"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Tâches en cours</h2>
+        <div id="active-jobs"></div>
+      </div>
+
+      <div class="card">
+        <h2>Historique</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Tâche</th><th>Statut</th><th>Début</th><th>Durée</th><th>Résultat</th></tr></thead>
+            <tbody id="history-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ----- Garmin ----- -->
+    <section class="tab-panel" data-panel="garmin" hidden>
+      <div class="grid-2">
+        <div class="card">
+          <h2>Compte</h2>
+          <div id="garmin-status-info"></div>
+          <div id="garmin-status-job"></div>
+          <div id="garmin-status-actions" class="row gap wrap"></div>
+        </div>
+
+        <div class="card" id="garmin-login-card" hidden>
+          <h2 id="garmin-login-title">Connecter un compte</h2>
+          <form id="garmin-login-form">
+            <label class="field"><span>Email Garmin Connect</span>
+              <input id="garmin-email" type="email" autocomplete="username" required></label>
+            <label class="field"><span>Mot de passe</span>
+              <input id="garmin-password" type="password" autocomplete="current-password" required></label>
+            <fieldset class="choice">
+              <legend>Mot de passe</legend>
+              <label class="choice-item">
+                <input type="radio" name="remember" value="no" checked>
+                <span><strong>Ne pas le mémoriser</strong> <em class="badge">recommandé</em>
+                  <small class="muted">Il sert uniquement à obtenir un jeton de session, puis il est oublié.
+                  Si la session expire un jour, il faudra te reconnecter ici.</small></span>
+              </label>
+              <label class="choice-item">
+                <input type="radio" name="remember" value="yes">
+                <span><strong>Le mémoriser sur le serveur</strong>
+                  <small class="muted">Enregistré en clair dans le dossier des jetons (lisible du seul service),
+                  pour te reconnecter tout seul si la session expire. Un code MFA redemandé
+                  nécessitera quand même une reconnexion ici.</small></span>
+              </label>
+            </fieldset>
+            <p id="garmin-login-error" class="error-text" hidden></p>
+            <div class="row gap">
+              <button class="btn primary" type="submit" id="garmin-login-btn">Se connecter</button>
+              <button class="btn ghost" type="button" id="garmin-login-cancel" hidden>Annuler</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="card" id="garmin-mfa-card" hidden>
+          <h2>Code de vérification</h2>
+          <p>Garmin a envoyé un code de vérification (email ou application). Saisis-le pour terminer la connexion.</p>
+          <form id="garmin-mfa-form" class="row gap wrap">
+            <input id="garmin-mfa-code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" required class="mfa-input">
+            <button class="btn primary" type="submit">Valider</button>
+            <button class="btn ghost" type="button" id="garmin-mfa-cancel">Annuler</button>
+          </form>
+          <p class="muted small" id="garmin-mfa-timer"></p>
+          <p id="garmin-mfa-error" class="error-text" hidden></p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Synchronisation automatique</h2>
+        <form id="garmin-settings-form" class="settings-grid">
+          <label class="switch-field">
+            <input type="checkbox" id="gs-enabled">
+            <span class="switch" aria-hidden="true"></span>
+            <span>Synchronisation automatique activée</span>
+          </label>
+          <label class="field"><span>Intervalle (minutes)</span>
+            <input type="number" id="gs-interval" min="5" max="10080" required></label>
+          <label class="field"><span>Profondeur d'historique au premier import (jours)</span>
+            <input type="number" id="gs-lookback" min="1" max="36500" required></label>
+          <label class="field"><span>Taille des lots d'ingestion</span>
+            <input type="number" id="gs-batch" min="0" max="10000" required>
+            <small class="muted">0 = un seul import à la fin du téléchargement ; sinon, import progressif par lots.</small></label>
+          <div class="row gap full">
+            <button class="btn primary" type="submit">Enregistrer</button>
+            <button class="btn ghost" type="button" id="gs-reset">Revenir à config.yaml</button>
+            <span class="muted small" id="gs-source"></span>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <!-- ----- Données ----- -->
+    <section class="tab-panel" data-panel="data" hidden>
+      <div class="card">
+        <h2>Ajouter des traces</h2>
+        <label class="dropzone" id="dropzone">
+          <input type="file" id="upload-input" accept=".gpx" multiple hidden>
+          <strong>Glisse des fichiers .gpx ici</strong>
+          <span class="muted">ou clique pour les choisir — ils sont importés automatiquement</span>
+        </label>
+        <ul class="upload-list" id="upload-list"></ul>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Fichiers</h2>
+          <div class="row gap wrap">
+            <input type="search" id="files-search" placeholder="Rechercher un fichier…">
+            <select id="files-status">
+              <option value="all">Tous</option>
+              <option value="ok">Importés</option>
+              <option value="failed">En erreur</option>
+              <option value="legacy">Ancienne version</option>
+            </select>
+            <button class="btn" id="retry-all-btn" hidden>Réessayer les fichiers en erreur</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Fichier</th><th>Statut</th><th class="num">Points</th><th class="num">Taille</th><th>Importé</th><th></th></tr></thead>
+            <tbody id="files-body"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <span class="muted small" id="files-count"></span>
+          <div class="row gap">
+            <button class="btn ghost small" id="files-prev">Précédent</button>
+            <button class="btn ghost small" id="files-next">Suivant</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ----- Rendu ----- -->
+    <section class="tab-panel" data-panel="render" hidden>
+      <div class="render-layout">
+        <form class="card render-form" id="render-form">
+          <h2>Réglages de rendu</h2>
+          <div class="settings-grid two">
+            <label class="field"><span>Zoom minimal</span><input type="number" id="r-min_zoom" min="0" max="24" required></label>
+            <label class="field"><span>Zoom maximal</span><input type="number" id="r-max_zoom" min="0" max="24" required></label>
+          </div>
+          <div class="slider-field" data-key="line_width_px" data-min="1" data-max="12" data-step="1">
+            <span>Épaisseur du trait <small class="muted">px</small></span></div>
+          <div class="slider-field" data-key="blur_sigma_px" data-min="0" data-max="12" data-step="0.5">
+            <span>Flou (effet « glow ») <small class="muted">px</small></span></div>
+          <div class="slider-field" data-key="color_saturation" data-min="1" data-max="100" data-step="1">
+            <span>Saturation <small class="muted">passages pour la couleur maximale</small></span></div>
+          <div class="slider-field" data-key="contrast_boost" data-min="0" data-max="100" data-step="1">
+            <span>Contraste des faibles densités <small class="muted">0 = linéaire</small></span></div>
+
+          <h3>Dégradé de couleurs</h3>
+          <div class="gradient-bar" id="gradient-bar"></div>
+          <div id="gradient-stops"></div>
+          <button type="button" class="btn ghost small" id="add-stop">+ Ajouter un palier</button>
+
+          <p id="render-error" class="error-text" hidden></p>
+          <div class="row gap wrap sticky-actions">
+            <button class="btn primary" type="submit">Appliquer et recalculer</button>
+            <button class="btn ghost" type="button" id="render-revert">Annuler les modifications</button>
+            <button class="btn ghost" type="button" id="render-reset">Revenir à config.yaml</button>
+          </div>
+          <p class="muted small" id="render-source"></p>
+        </form>
+
+        <div class="card map-card">
+          <div class="card-head">
+            <h2>Aperçu</h2>
+            <div class="segmented" role="radiogroup">
+              <label><input type="radio" name="map-layer" value="preview" checked><span>Réglages en cours</span></label>
+              <label><input type="radio" name="map-layer" value="published"><span>Tuiles publiées</span></label>
+            </div>
+          </div>
+          <div id="map"></div>
+          <p class="muted small">L'aperçu est calculé à la volée avec les réglages du formulaire, sans rien modifier.
+            « Appliquer » enregistre les réglages et recalcule toutes les tuiles.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ----- Journal ----- -->
+    <section class="tab-panel" data-panel="logs" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>Journal</h2>
+          <div class="row gap wrap">
+            <select id="log-level">
+              <option value="INFO">Info et plus</option>
+              <option value="WARNING">Avertissements et erreurs</option>
+              <option value="ERROR">Erreurs</option>
+            </select>
+            <input type="search" id="log-filter" placeholder="Filtrer…">
+            <label class="row gap small"><input type="checkbox" id="log-pause"> Pause</label>
+            <button class="btn ghost small" id="log-clear">Vider l'affichage</button>
+          </div>
+        </div>
+        <div class="log-view" id="log-view"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<dialog id="confirm-dialog" class="dialog">
+  <form method="dialog">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-message"></p>
+    <div class="row gap end">
+      <button class="btn ghost" value="cancel">Annuler</button>
+      <button class="btn primary" value="ok" id="confirm-ok">Confirmer</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/admin/static/admin.js"></script>
+</body>
+</html>

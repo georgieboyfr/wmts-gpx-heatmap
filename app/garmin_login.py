@@ -1,7 +1,7 @@
 """
-A lancer UNE SEULE FOIS, à la main, pour établir la session Garmin Connect
-(gère le code MFA si activé) et générer le jeton mis en cache. Les lancements
-suivants du service rechargent ce jeton automatiquement, sans interaction.
+Alternative en ligne de commande à la connexion depuis l'admin (onglet Garmin) :
+établit la session Garmin Connect (gère le code MFA si activé) et génère le jeton
+mis en cache, que le service recharge ensuite automatiquement.
 
 Usage (depuis la racine du projet, avec les variables d'environnement définies) :
 

@@ -1,11 +1,11 @@
-version: "3.8"
-
 services:
   wmts-gpx-heatmap:
     build: .
     image: wmts-gpx-heatmap:latest
     container_name: wmts-gpx-heatmap
     restart: unless-stopped
+    # utilisateur propriétaire des dossiers de données ci-dessous (voir PUID/PGID dans .env)
+    user: "${PUID:-1000}:${PGID:-1000}"
     ports:
       - "8088:8088"
     volumes:
@@ -16,6 +16,7 @@ services:
       - ./config.yaml:/config/config.yaml:ro
     environment:
       - CONFIG_PATH=/config/config.yaml
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - GARMIN_EMAIL=${GARMIN_EMAIL:-}
       - GARMIN_PASSWORD=${GARMIN_PASSWORD:-}
       - GARMIN_TOKEN_STORE=/data/garmin_tokens

@@ -2,7 +2,7 @@ services:
   wmts-gpx-heatmap:
     # image publiée sur GitHub (Intel/AMD et ARM) : rien d'autre à télécharger.
     # Pour construire depuis le code source à la place : remplacer par `build: .`
-    image: ghcr.io/georgieboyfr/wmts-gpx-heatmap:1.0.2
+    image: ghcr.io/georgieboyfr/wmts-gpx-heatmap:1.0.3
     container_name: wmts-gpx-heatmap
     restart: unless-stopped
     # utilisateur propriétaire des dossiers de données ci-dessous (voir PUID/PGID dans .env)

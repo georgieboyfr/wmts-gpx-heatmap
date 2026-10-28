@@ -16,7 +16,14 @@ jobs:
   image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      # même version de Python que l'image (le Python système d'Ubuntu refuse `pip install`)
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
 
       - name: Tests
         run: |

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.3 — 2026-10-28
+
+### Fixes
+- Image publication workflow: run the tests on Python 3.12 (the 1.0.2 run failed before building, so no 1.0.2 image was published).
+
 ## 1.0.2 — 2026-10-28
 
 ### Changes

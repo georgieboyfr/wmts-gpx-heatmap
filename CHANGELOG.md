@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.7 — 2026-10-29
+
+### Performance
+- Much lower memory peaks, which could exhaust the RAM of a small NAS on a large history (measured with 2 M points):
+  - **Import**: GPX files read in a batch (first Garmin sync, reindex...) are kept as compact numpy arrays and inserted into the database as a stream, instead of Python lists of tuples: peak memory down from ~284 to ~49 bytes per imported point.
+  - **Startup**: points are loaded in chunks into pre-allocated arrays instead of one Python tuple per point: peak down from 359 MB to 77 MB for 46 MB of points.
+  - **Admin preview**: the point selection cache is now limited to 64 MB instead of a number of entries, which could reach several hundred MB on a large database.
+- Points take half the memory: coordinates are kept as 32-bit integers in microdegrees (~11 cm precision) and track ids / point indices as 32-bit integers, i.e. 12 bytes per point instead of 24 (the database still stores full-precision coordinates).
+- **Tracks are simplified on import** (Douglas-Peucker): points closer than `ingest.simplify_tolerance_m` (1 m by default) to the simplified line are dropped, with no visible change in the rendering. Typically 4 to 10 times fewer points for a GPS watch (only ~1.3x for very noisy raw GPS), so less memory and faster rendering. `0` keeps every point. **Run *Reindex everything* once** to simplify tracks imported by earlier versions.
+
 ## 1.0.6 — 2026-10-29
 
 ### Admin

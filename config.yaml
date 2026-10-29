@@ -13,6 +13,12 @@ render:
                                 # changer color_saturation. Monte à 20-40+ si un passage unique te semble
                                 # trop discret ; plus la valeur est haute, plus même une seule trace ressort.
 
+ingest:
+  simplify_tolerance_m: 1.0     # simplification des traces à l'import : un point à moins de 1 m du tracé
+                                # simplifié est retiré (4 à 10 fois moins de points pour une montre GPS,
+                                # rendu identique). 0 = garder tous les points. Après un changement :
+                                # « Réindexer tout » pour l'appliquer aux traces déjà importées.
+
 # Dégradé de couleur (fraction 0-1 -> [R,G,B,A]). Modifiable librement.
 # Ici : style "Strava heatmap" mais en tons bleus (fond sombre recommandé côté carte) :
 # transparent -> bleu marine -> bleu vif -> cyan -> blanc pour les zones les plus fréquentées.

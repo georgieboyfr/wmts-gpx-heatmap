@@ -19,6 +19,7 @@ Les opérations longues acceptent un objet `progress` (voir jobs.py) pour remont
 leur avancement et pouvoir être annulées.
 """
 import io
+import itertools
 import logging
 import math
 import os
@@ -44,7 +45,10 @@ TILE_SIZE = 256
 BLUR_TRUNCATE = 4.0  # rayon du noyau gaussien, en sigmas (valeur par défaut de scipy)
 MAX_LAT = 85.05
 FILE_STATUS = {1: "ok", 0: "failed", 2: "legacy"}
-PREVIEW_CACHE_SIZE = 512  # sélections de points gardées pour l'aperçu de l'admin
+PREVIEW_CACHE_BYTES = 64 * 2**20  # mémoire max des sélections de points gardées pour l'aperçu
+LOAD_CHUNK = 100_000  # points lus par bloc au démarrage
+COORD_SCALE = 1_000_000  # coordonnées en mémoire : entiers 32 bits en microdegrés (~11 cm)
+DEFAULT_SIMPLIFY_M = 1.0  # tolérance de simplification des traces à l'import (mètres)
 
 
 def _file_signature(path):
@@ -95,6 +99,50 @@ def _validate_config(render: dict, gradient) -> None:
                 break
     if errors:
         raise ValueError("Configuration invalide : " + " ; ".join(errors))
+
+
+def _to_e6(degrees):
+    return np.round(np.asarray(degrees, dtype=np.float64) * COORD_SCALE).astype(np.int32)
+
+
+def _indices(n):
+    """0..n-1 dans le plus petit type d'index possible (4 octets au lieu de 8)."""
+    return np.arange(n, dtype=np.int32 if n < 2**31 else np.int64)
+
+
+def simplify_track(latlon, tolerance_m):
+    """Indices des points à garder (Douglas-Peucker) : un point est retiré s'il est à
+    moins de `tolerance_m` du tracé simplifié. Un GPS à 1 point/s en enregistre beaucoup
+    plus qu'il n'en faut pour le dessin (un pixel au zoom 16 fait ~1,6 m à Paris).
+    La distance est mesurée au SEGMENT et non à la droite : un aller-retour sur le même
+    chemin garde son point de demi-tour."""
+    n = len(latlon)
+    if n < 3 or tolerance_m <= 0:
+        return np.arange(n)
+    # projection locale en mètres, suffisante à l'échelle d'une trace
+    lat0 = math.radians(float(np.mean(latlon[:, 0])))
+    x = latlon[:, 1] * (111_320.0 * math.cos(lat0))
+    y = latlon[:, 0] * 110_574.0
+    keep = np.zeros(n, dtype=bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j - i < 2:
+            continue
+        ax, ay = x[i], y[i]
+        dx, dy = x[j] - ax, y[j] - ay
+        px, py = x[i + 1:j] - ax, y[i + 1:j] - ay
+        length2 = dx * dx + dy * dy
+        t = np.clip((px * dx + py * dy) / length2, 0, 1) if length2 > 0 else 0.0
+        dist2 = (px - t * dx) ** 2 + (py - t * dy) ** 2
+        k = int(np.argmax(dist2))
+        if dist2[k] > tolerance_m * tolerance_m:
+            k += i + 1
+            keep[k] = True
+            stack.append((i, k))
+            stack.append((k, j))
+    return np.flatnonzero(keep)
 
 
 def _make_lut(gradient_stops, n=256):
@@ -165,14 +213,16 @@ class RenderParams:
 @dataclass(frozen=True, eq=False)
 class Points:
     """Points en mémoire, triés par segment puis par ordre de passage (les runs d'un
-    même seg_id sont contigus). Jamais modifié en place."""
+    même seg_id sont contigus). Jamais modifié en place. lat / lon sont des entiers
+    32 bits en microdegrés et seg un entier 32 bits : 12 octets par point au lieu de 24
+    (la base garde les coordonnées complètes)."""
     seg: np.ndarray
     lat: np.ndarray
     lon: np.ndarray
 
     @classmethod
     def empty(cls):
-        return cls(np.empty((0,), dtype=np.int64), np.empty((0,)), np.empty((0,)))
+        return cls(*(np.empty((0,), dtype=np.int32) for _ in range(3)))
 
     def __len__(self):
         return len(self.lat)
@@ -181,6 +231,7 @@ class Points:
 class HeatmapEngine:
     def __init__(self, config: dict):
         self.params = RenderParams.from_config(config["render"], config.get("color_gradient"))
+        self.simplify_m = float((config.get("ingest") or {}).get("simplify_tolerance_m", DEFAULT_SIMPLIFY_M))
         self.tiles_dir = Path(config["paths"]["tiles"])
         self.db_path = Path(config["paths"]["db"])
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -260,12 +311,22 @@ class HeatmapEngine:
         self._read_conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
 
     def _load_points(self):
-        rows = self.conn.execute("SELECT seg_id, lat, lon FROM points ORDER BY seg_id, seq").fetchall()
-        if rows:
+        # lecture par blocs dans des tableaux alloués d'avance : un fetchall() créerait un
+        # tuple Python par point (~180 octets chacun, 7 fois la taille des tableaux finaux)
+        n = self.conn.execute("SELECT COUNT(*) FROM points").fetchone()[0]
+        seg, lat, lon = (np.empty(n, dtype=np.int32) for _ in range(3))
+        cur = self.conn.execute("SELECT seg_id, lat, lon FROM points ORDER BY seg_id, seq")
+        i = 0
+        while i < n:
+            rows = cur.fetchmany(LOAD_CHUNK)
+            if not rows:
+                break
             arr = np.array(rows, dtype=np.float64)
-            self.pts = Points(arr[:, 0].astype(np.int64), arr[:, 1], arr[:, 2])
-        else:
-            self.pts = Points.empty()
+            seg[i:i + len(arr)] = arr[:, 0]
+            lat[i:i + len(arr)] = _to_e6(arr[:, 1])
+            lon[i:i + len(arr)] = _to_e6(arr[:, 2])
+            i += len(arr)
+        self.pts = Points(seg[:i], lat[:i], lon[:i])
         max_seg = self.conn.execute(
             "SELECT MAX(m) FROM (SELECT MAX(seg_id) AS m FROM points UNION ALL SELECT MAX(seg_id) FROM segments)"
         ).fetchone()[0]
@@ -311,11 +372,17 @@ class HeatmapEngine:
                 return 0
 
             progress.phase("Lecture des GPX", len(todo))
-            parsed = []  # (chemin, signature, segments ou None, erreur)
+            # (chemin, signature, segments ou None, erreur) ; chaque segment est converti tout de
+            # suite en tableau (n, 2) : 16 octets par point au lieu de ~150 pour une liste de
+            # tuples, ce qui compte pour un gros lot (premier import Garmin, réindexation)
+            parsed = []
             for path, sig in todo:
                 try:
                     segments, waypoints = gpx_utils.parse_gpx_segments(path)
-                    parsed.append((path, sig, segments + [[wp] for wp in waypoints], None))
+                    arrays = [np.array(s, dtype=np.float64) for s in segments + [[wp] for wp in waypoints]]
+                    arrays = [a[simplify_track(a, self.simplify_m)] for a in arrays]
+                    del segments, waypoints
+                    parsed.append((path, sig, arrays, None))
                 except Exception as e:
                     log.exception("GPX illisible/invalide, ignoré : %s", path)
                     parsed.append((path, sig, None, str(e) or e.__class__.__name__))
@@ -325,7 +392,7 @@ class HeatmapEngine:
             changed = [p for p, _ in todo if self._file_row(p) is not None]
             old = self._remove_from_store(changed)
 
-            rows, seg_rows, file_rows = [], [], []
+            seg_arrays, seg_rows, file_rows = [], [], []  # seg_arrays : (seg_id, tableau (n, 2))
             now = time.time()
             for path, sig, segments, error in parsed:
                 if segments is None:
@@ -333,20 +400,24 @@ class HeatmapEngine:
                     # (ex : copie encore en cours au moment de la lecture)
                     file_rows.append((path, *sig, 0, None, now, error[:500]))
                     continue
-                n_points = 0
                 for pts in segments:
                     sid = self._next_seg_id
                     self._next_seg_id += 1
                     seg_rows.append((sid, path))
-                    rows.extend((sid, i, lat, lon) for i, (lat, lon) in enumerate(pts))
-                    n_points += len(pts)
-                file_rows.append((path, *sig, 1, n_points, now, None))
+                    seg_arrays.append((sid, pts))
+                file_rows.append((path, *sig, 1, sum(len(s) for s in segments), now, None))
+            del parsed
 
-            failed = sum(1 for p in parsed if p[2] is None)
+            failed = sum(1 for r in file_rows if r[3] == 0)
             if failed:
                 log.warning("%d fichier(s) GPX invalide(s) ignoré(s) lors de cet import", failed)
 
-            self.conn.executemany("INSERT INTO points(seg_id, seq, lat, lon) VALUES (?,?,?,?)", rows)
+            def point_rows():
+                # générées segment par segment : jamais tout le lot en tuples Python à la fois
+                for sid, pts in seg_arrays:
+                    yield from zip(itertools.repeat(sid), range(len(pts)), pts[:, 0].tolist(), pts[:, 1].tolist())
+
+            self.conn.executemany("INSERT INTO points(seg_id, seq, lat, lon) VALUES (?,?,?,?)", point_rows())
             self.conn.executemany("INSERT INTO segments(seg_id, path) VALUES (?,?)", seg_rows)
             self.conn.executemany(
                 "INSERT OR REPLACE INTO ingested_files(path, mtime, size, ok, points, imported_at, error) "
@@ -354,9 +425,11 @@ class HeatmapEngine:
             )
             self.conn.commit()
 
-            if rows:
-                arr = np.array(rows, dtype=np.float64)
-                new = Points(arr[:, 0].astype(np.int64), arr[:, 2], arr[:, 3])
+            if seg_arrays:
+                new = Points(np.concatenate([np.full(len(pts), sid, dtype=np.int32) for sid, pts in seg_arrays]),
+                             _to_e6(np.concatenate([pts[:, 0] for _, pts in seg_arrays])),
+                             _to_e6(np.concatenate([pts[:, 1] for _, pts in seg_arrays])))
+                del seg_arrays
                 self.pts = Points(np.concatenate([self.pts.seg, new.seg]),
                                   np.concatenate([self.pts.lat, new.lat]),
                                   np.concatenate([self.pts.lon, new.lon]))
@@ -402,7 +475,7 @@ class HeatmapEngine:
         if not seg_ids:
             return Points.empty()
         pts = self.pts
-        mask = np.isin(pts.seg, np.array(seg_ids, dtype=np.int64))
+        mask = np.isin(pts.seg, np.array(seg_ids, dtype=pts.seg.dtype))
         keep = ~mask
         self.pts = Points(pts.seg[keep], pts.lat[keep], pts.lon[keep])
         return Points(pts.seg[mask], pts.lat[mask], pts.lon[mask])
@@ -490,10 +563,10 @@ class HeatmapEngine:
         # les tableaux sont dans l'ordre d'insertion (par seg_id croissant) -> les runs
         # d'un même seg_id sont contigus, pas besoin de trier
         starts = np.concatenate([[0], np.flatnonzero(np.diff(seg_new)) + 1])
-        bboxes = list(zip(
-            np.minimum.reduceat(lon_new, starts), np.minimum.reduceat(lat_new, starts),
-            np.maximum.reduceat(lon_new, starts), np.maximum.reduceat(lat_new, starts),
-        ))
+        bboxes = list(zip(*(
+            (reduce.reduceat(coord, starts) / COORD_SCALE).tolist()
+            for reduce, coord in ((np.minimum, lon_new), (np.minimum, lat_new), (np.maximum, lon_new), (np.maximum, lat_new))
+        )))
 
         progress.phase("Recherche des tuiles", params.max_zoom - params.min_zoom + 1)
         tiles = set()
@@ -515,7 +588,7 @@ class HeatmapEngine:
         très fréquentée ralentisse fortement le calcul aux grands zooms."""
         progress.phase("Calcul des tuiles", len(tiles))
         pts = self.pts
-        all_idx = np.arange(len(pts))
+        all_idx = _indices(len(pts))
         selections = {}  # (z, x, y) -> indices des points nécessaires à la tuile
 
         def selection(z, x, y):
@@ -551,6 +624,9 @@ class HeatmapEngine:
         point (points espacés, route planifiée, fort zoom) n'y serait pas dessiné."""
         if len(idx) == 0:
             return idx
+        # bornes en microdegrés, arrondies vers l'extérieur
+        w, s = math.floor(w * COORD_SCALE), math.floor(s * COORD_SCALE)
+        e, n = math.ceil(e * COORD_SCALE), math.ceil(n * COORD_SCALE)
         lon, lat = pts.lon[idx], pts.lat[idx]
         keep = (lon >= w) & (lon <= e) & (lat >= s) & (lat <= n)
         if len(idx) >= 2:
@@ -574,7 +650,7 @@ class HeatmapEngine:
         pad = params.pad
         canvas_size = TILE_SIZE + 2 * pad
         canvas = np.zeros((canvas_size, canvas_size), dtype=np.float32)
-        px, py = self._lonlat_to_pixel(pts.lon[idx], pts.lat[idx], z)
+        px, py = self._lonlat_to_pixel(pts.lon[idx] / COORD_SCALE, pts.lat[idx] / COORD_SCALE, z)
         lx = px - (x * TILE_SIZE - pad)
         ly = py - (y * TILE_SIZE - pad)
 
@@ -651,10 +727,13 @@ class HeatmapEngine:
                 cache.move_to_end(tile)
             else:
                 missing.append(tile)
-                idx = np.arange(len(pts))
+                idx = _indices(len(pts))
             for tile in reversed(missing):
                 idx = cache[tile] = self._select(pts, idx, *self._canvas_bounds(params, *tile))
-            while len(cache) > PREVIEW_CACHE_SIZE:
+            # limite en octets, pas en nombre : aux petits zooms une sélection peut contenir
+            # presque tous les points. Un même tableau partagé par plusieurs tuiles (voir
+            # _select) n'est compté qu'une fois ; la sélection demandée est toujours gardée.
+            while len(cache) > 1 and sum({id(a): a.nbytes for a in cache.values()}.values()) > PREVIEW_CACHE_BYTES:
                 cache.popitem(last=False)
             return idx
 
@@ -719,8 +798,8 @@ class HeatmapEngine:
             return bounds
         bounds = None
         if len(pts):
-            lo_lon, hi_lon = np.percentile(pts.lon, [0.5, 99.5])
-            lo_lat, hi_lat = np.percentile(pts.lat, [0.5, 99.5])
+            lo_lon, hi_lon = np.percentile(pts.lon, [0.5, 99.5]) / COORD_SCALE
+            lo_lat, hi_lat = np.percentile(pts.lat, [0.5, 99.5]) / COORD_SCALE
             bounds = [float(lo_lon), float(lo_lat), float(hi_lon), float(hi_lat)]
         self._bounds_cache = (pts, bounds)
         return bounds

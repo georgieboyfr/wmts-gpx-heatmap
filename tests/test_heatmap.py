@@ -84,7 +84,7 @@ def test_modified_file_replaces_its_points(engine, gpx_dir):
     p = write_gpx(gpx_dir / "a.gpx", [(LAT, 2.0), (LAT, 2.01)])
     assert engine.bulk_ingest([p]) == 1
     assert engine.bulk_ingest([p]) == 0  # inchangé : ignoré
-    write_gpx(p, [(LAT, 2.0), (LAT, 2.01), (LAT, 2.02)])
+    write_gpx(p, [(LAT, 2.0), (LAT, 2.01), (LAT + 0.01, 2.02)])  # 3e point hors ligne : gardé
     assert engine.needs_ingest(p)
     assert engine.bulk_ingest([p]) == 1
     assert engine.point_count == 3
@@ -195,6 +195,31 @@ def test_preview_follows_point_changes(engine, gpx_dir):
     assert engine.render_preview(14, tile.x, tile.y, engine.params) != first
 
 
+def test_points_reloaded_in_chunks_are_identical(config, gpx_dir, monkeypatch):
+    from app import heatmap
+    engine = HeatmapEngine(config)
+    engine.bulk_ingest([write_gpx(gpx_dir / f"{i}.gpx", [(LAT, 2.0 + i * 0.01), (LAT + 0.001, 2.005 + i * 0.01), (LAT, 2.01 + i * 0.01)],
+                                  waypoints=[(LAT + 0.002, 2.0)]) for i in range(3)], render=False)
+    before = engine.pts
+    engine.close()
+    monkeypatch.setattr(heatmap, "LOAD_CHUNK", 2)  # blocs plus petits qu'un segment
+    engine = HeatmapEngine(config)
+    for name in ("seg", "lat", "lon"):
+        assert np.array_equal(getattr(engine.pts, name), getattr(before, name))
+    assert engine.pts.seg.dtype == np.int32
+    engine.close()
+
+
+def test_preview_cache_is_bounded_in_bytes(engine, gpx_dir, monkeypatch):
+    from app import heatmap
+    monkeypatch.setattr(heatmap, "PREVIEW_CACHE_BYTES", 1)  # rien ne tient : seule la dernière reste
+    engine.bulk_ingest([write_gpx(gpx_dir / "a.gpx", [(LAT, 2.0), (LAT, 2.2)])])
+    for lon in (2.05, 2.1, 2.15):
+        tile = mercantile.tile(lon, LAT, 14)
+        assert engine.render_preview(14, tile.x, tile.y, engine.params)
+        assert len(engine._preview_cache[1]) == 1
+
+
 @pytest.mark.parametrize("width, sigma", [(2, 2), (3, 4), (6, 0)])
 def test_single_pass_reaches_saturation_despite_blur(tmp_path, gpx_dir, width, sigma):
     # color_saturation = 1 : un passage isolé doit atteindre le haut du dégradé, quel que
@@ -241,3 +266,44 @@ def test_contrast_boost_zero_is_linear(tmp_path, gpx_dir):
     engine.bulk_ingest([write_gpx(gpx_dir / "a.gpx", [(LAT, 2.0), (LAT, 2.01)])])
     assert list(engine.tiles_dir.rglob("*.png"))
     engine.close()
+
+
+# ---------- simplification des traces ----------
+
+def test_simplify_drops_points_close_to_the_line():
+    from app.heatmap import simplify_track
+    rng = np.random.default_rng(0)
+    lon = np.linspace(2.0, 2.01, 200)  # ~730 m, un point tous les ~3,7 m
+    lat = LAT + rng.normal(0, 2e-6, 200)  # bruit de ~0,2 m
+    assert list(simplify_track(np.c_[lat, lon], 1.0)) == [0, 199]
+    assert len(simplify_track(np.c_[lat, lon], 0)) == 200  # 0 = désactivée
+
+
+@pytest.mark.parametrize("back_to", [2.0, 2.005])
+def test_simplify_keeps_turnaround_of_out_and_back(back_to):
+    # aller puis retour (complet ou partiel) sur la même ligne : le demi-tour est sur la
+    # droite qui relie les extrémités, mais pas sur le segment qui les relie
+    from app.heatmap import simplify_track
+    lon = np.r_[np.linspace(2.0, 2.01, 11), np.linspace(2.01, back_to, 11)[1:]]
+    kept = simplify_track(np.c_[np.full(len(lon), LAT), lon], 1.0)
+    assert 10 in kept and np.isclose(lon[kept].max(), 2.01)
+
+
+def test_simplified_track_renders_like_the_original(tmp_path, gpx_dir):
+    rng = np.random.default_rng(1)
+    n = 600  # trace sinueuse, ~1 point/3 m, bruit GPS de ~1 m
+    t = np.linspace(0, 1, n)
+    seg = list(zip(LAT + 0.004 * np.sin(t * 9) + rng.normal(0, 1e-5, n), 2.0 + 0.02 * t + rng.normal(0, 1e-5, n)))
+    alphas = {}
+    for tol in (0, 1.0):
+        engine = HeatmapEngine({**make_config(tmp_path / str(tol), min_zoom=14, max_zoom=14),
+                                "ingest": {"simplify_tolerance_m": tol}})
+        engine.bulk_ingest([write_gpx(gpx_dir / f"{tol}.gpx", seg)])
+        alphas[tol] = {p.relative_to(engine.tiles_dir): np.asarray(Image.open(p))[:, :, 3].astype(int)
+                       for p in engine.tiles_dir.rglob("*.png")}
+        points = engine.point_count
+        engine.close()
+    assert points < n / 2  # au moins 2 fois moins de points
+    assert alphas[0].keys() == alphas[1.0].keys()
+    diff = max(np.abs(alphas[0][k] - alphas[1.0][k]).max() for k in alphas[0])
+    assert diff <= 40, diff  # quelques niveaux d'opacité sur le bord du trait, au plus

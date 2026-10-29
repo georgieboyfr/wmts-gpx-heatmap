@@ -215,4 +215,4 @@ def test_logs_endpoint(main, client):
 
 
 def test_health(client):
-    assert client.get("/health").json() == {"status": "ok", "version": "1.0.6", "points": 0}
+    assert client.get("/health").json() == {"status": "ok", "version": "1.0.7", "points": 0}

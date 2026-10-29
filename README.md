@@ -32,7 +32,7 @@ Built to run on modest hardware (a home NAS such as Synology, a Raspberry Pi...)
 ## Architecture at a glance
 
 A single Python container (FastAPI + numpy/scipy/Pillow):
-- GPX tracks are stored as continuous polylines (SQLite for persistence, numpy arrays in memory for computation);
+- GPX tracks are stored as continuous polylines (SQLite for persistence, compact numpy arrays in memory for computation: 12 bytes per point), simplified on import (points within 1 m of the line are dropped, typically 4-10x fewer points for a GPS watch);
 - tiles are pre-rendered as PNG and served as static files (no on-the-fly rendering per request);
 - only the tiles actually affected by a new track are (re)computed — never the whole pyramid;
 - tiles are written atomically, so a client never receives a half-written tile, and are served with an `ETag` (cheap `304` revalidation).
@@ -49,7 +49,7 @@ A ready-to-use image is published for Intel/AMD and ARM machines: **`ghcr.io/geo
 ```yaml
 services:
   wmts-gpx-heatmap:
-    image: ghcr.io/georgieboyfr/wmts-gpx-heatmap:1.0.6
+    image: ghcr.io/georgieboyfr/wmts-gpx-heatmap:1.0.7
     container_name: wmts-gpx-heatmap
     restart: unless-stopped
     user: "1000:1000"                    # owner of the data folders (`id` on the host; often 1026:100 on Synology)
@@ -157,6 +157,11 @@ render:
   contrast_boost: 9.0         # boosts the visibility of low densities (e.g. a single pass) without
                                # touching the saturation threshold; try 20-40+ to make a single track stand out more
 
+ingest:
+  simplify_tolerance_m: 1.0   # track simplification on import: points closer than this to the simplified
+                               # line are dropped (rendering unchanged); 0 = keep every point.
+                               # Run "Reindex everything" afterwards to apply it to tracks already imported
+
 color_gradient:                # [position 0-1, [R, G, B, Alpha]] - fully free gradient, as many stops as you want
   - [0.00, [10, 15, 40, 0]]
   - [0.15, [15, 40, 95, 130]]
@@ -223,6 +228,7 @@ The session token is stored in the `garmin_tokens` volume (a remembered password
 
 ## Upgrading from an earlier version
 
+- **From 1.0.6 or earlier**: tracks imported before 1.0.7 are not simplified. Run *Reindex everything* once to simplify them too (memory and rendering time drop accordingly).
 - Switch the compose file to the published image (see *Installation*): replace `build: .` with `image: ghcr.io/georgieboyfr/wmts-gpx-heatmap:<version>`. If you had a customized `config.yaml`, keep mounting it (`./config.yaml:/config/config.yaml:ro`); otherwise set `BASE_URL`.
 - The container no longer runs as root. Either give the data folders to the default user (`sudo chown -R 1000:1000 /volume1/docker/wmts-gpx-heatmap`) or set `PUID`/`PGID` in `.env` to their current owner.
 - Set `ADMIN_TOKEN` in `.env` (the admin is disabled without it).
@@ -232,6 +238,7 @@ The session token is stored in the `garmin_tokens` volume (a remembered password
 ## Known limitations
 
 - Point-to-tile filtering uses numpy, narrowed per parent tile at `min_zoom` (fast up to a few million points; beyond that, a real spatial index would be worth adding).
+- All points are kept in memory (12 bytes per point after simplification: ~20 MB for 5 years of activities from a GPS watch); peaks during import and startup stay within a few times that.
 - Tiles are not authenticated, and the admin only by a shared token over plain HTTP (the session cookie is marked `Secure` automatically behind HTTPS) — put this behind a reverse proxy with TLS and restricted access if exposed to the internet.
 - CORS is open to any origin (`*`), read-only — restrict `allow_origins` in `app/main.py` if the service leaves your local network.
 

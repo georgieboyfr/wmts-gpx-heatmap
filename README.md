@@ -16,8 +16,17 @@ Built to run on modest hardware (a home NAS such as Synology, a Raspberry Pi...)
 ## Preview
 
 <p align="center">
-  <img src="docs/heatmap-example.png" alt="Heatmap Example" width="500">
+  <img src="docs/heatmap.jpg" alt="Heatmap rendered over an OpenStreetMap basemap" width="460">
 </p>
+
+<table align="center">
+  <tr>
+    <td align="center"><a href="docs/admin-dashboard.jpg"><img src="docs/admin-dashboard.jpg" alt="Admin dashboard with a tile recompute in progress" width="340"></a><br><sub>Admin — dashboard and background tasks</sub></td>
+    <td align="center"><a href="docs/admin-render.jpg"><img src="docs/admin-render.jpg" alt="Admin render settings with the live preview map" width="340"></a><br><sub>Admin — render settings with live preview</sub></td>
+  </tr>
+</table>
+
+<p align="center"><sub>Demo data: synthetic tracks. Click a screenshot to enlarge it.</sub></p>
 
 
 ## Architecture at a glance

@@ -33,7 +33,7 @@ Built to run on modest hardware (a home NAS such as Synology, a Raspberry Pi...)
 
 A single Python container (FastAPI + numpy/scipy/Pillow):
 - GPX tracks are stored as continuous polylines (SQLite for persistence, compact numpy arrays in memory for computation: 12 bytes per point), simplified on import (points within 1 m of the line are dropped, typically 4-10x fewer points for a GPS watch);
-- tiles are pre-rendered as PNG and served as static files (no on-the-fly rendering per request);
+- tiles are pre-rendered as palette PNGs (1 byte per pixel, pixel-identical to full-color output) and served as static files (no on-the-fly rendering per request); large recomputes are spread over several processes;
 - only the tiles actually affected by a new track are (re)computed — never the whole pyramid;
 - tiles are written atomically, so a client never receives a half-written tile, and are served with an `ETag` (cheap `304` revalidation).
 
@@ -161,6 +161,11 @@ ingest:
   simplify_tolerance_m: 1.0   # track simplification on import: points closer than this to the simplified
                                # line are dropped (rendering unchanged); 0 = keep every point.
                                # Run "Reindex everything" afterwards to apply it to tracks already imported
+
+performance:
+  render_workers: 0           # processes used for large recomputes (reindex, new render settings, first import):
+                               # 0 = auto (available cores, at most 4, and no more than free memory allows).
+                               # Each process takes ~80 MB while computing: set 1 on a machine short on RAM
 
 color_gradient:                # [position 0-1, [R, G, B, Alpha]] - fully free gradient, as many stops as you want
   - [0.00, [10, 15, 40, 0]]

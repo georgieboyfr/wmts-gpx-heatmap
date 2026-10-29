@@ -19,7 +19,7 @@ LAT = 48.85
 def alpha(engine, tile):
     p = engine.get_tile_path(tile.z, tile.x, tile.y)
     assert p is not None, f"tuile {tile} absente"
-    return np.asarray(Image.open(p))[:, :, 3].astype(int)
+    return np.asarray(Image.open(p).convert("RGBA"))[:, :, 3].astype(int)
 
 
 def test_line_crossing_tile_without_points_is_drawn(engine, gpx_dir):
@@ -51,7 +51,7 @@ def reference_alpha(engine, segment, tile, pad=80):
     coords = list(zip((px - tile.x * TILE_SIZE + pad).tolist(), (py - tile.y * TILE_SIZE + pad).tolist()))
     ImageDraw.Draw(img).line(coords, fill=255, width=engine.line_width_px, joint="curve")
     canvas = ndimage.gaussian_filter((np.asarray(img) > 0).astype(np.float32), sigma=engine.blur_sigma_px)
-    return np.asarray(engine._colorize(canvas[pad:pad + TILE_SIZE, pad:pad + TILE_SIZE]))[:, :, 3].astype(int)
+    return np.asarray(engine._colorize(canvas[pad:pad + TILE_SIZE, pad:pad + TILE_SIZE]).convert("RGBA"))[:, :, 3].astype(int)
 
 
 def test_out_and_back_track_counts_once(engine, gpx_dir):
@@ -299,7 +299,7 @@ def test_simplified_track_renders_like_the_original(tmp_path, gpx_dir):
         engine = HeatmapEngine({**make_config(tmp_path / str(tol), min_zoom=14, max_zoom=14),
                                 "ingest": {"simplify_tolerance_m": tol}})
         engine.bulk_ingest([write_gpx(gpx_dir / f"{tol}.gpx", seg)])
-        alphas[tol] = {p.relative_to(engine.tiles_dir): np.asarray(Image.open(p))[:, :, 3].astype(int)
+        alphas[tol] = {p.relative_to(engine.tiles_dir): np.asarray(Image.open(p).convert("RGBA"))[:, :, 3].astype(int)
                        for p in engine.tiles_dir.rglob("*.png")}
         points = engine.point_count
         engine.close()
@@ -307,3 +307,86 @@ def test_simplified_track_renders_like_the_original(tmp_path, gpx_dir):
     assert alphas[0].keys() == alphas[1.0].keys()
     diff = max(np.abs(alphas[0][k] - alphas[1.0][k]).max() for k in alphas[0])
     assert diff <= 40, diff  # quelques niveaux d'opacité sur le bord du trait, au plus
+
+
+def test_palette_tile_is_pixel_identical_to_rgba(engine, tmp_path):
+    from app.heatmap import RenderParams
+    params = RenderParams.from_config({"min_zoom": 12, "max_zoom": 14, "line_width_px": 2, "blur_sigma_px": 2,
+                                       "color_saturation": 5, "contrast_boost": 10},
+                                      [[0, [10, 15, 40, 0]], [0.4, [25, 110, 210, 190]], [1, [255, 255, 255, 255]]])
+    intensity = np.random.default_rng(0).uniform(0, 6, (TILE_SIZE, TILE_SIZE)).astype(np.float32)
+    img = params.colorize(intensity)
+    assert img.mode == "P"
+    # référence : l'ancien rendu RGBA (LUT appliquée pixel par pixel)
+    norm = np.log1p(np.clip(intensity / params.vmax, 0, 1) * 10) / np.log1p(10)
+    expected = params.lut[(norm * 255).astype(np.uint8)]
+    engine._write_tile(tmp_path / "t.png", img)
+    assert np.array_equal(np.asarray(Image.open(tmp_path / "t.png").convert("RGBA")), expected)
+
+
+# ---------- rendu sur plusieurs processus ----------
+
+def _spread_tracks(gpx_dir):
+    rng = np.random.default_rng(3)
+    return [write_gpx(gpx_dir / f"{i}.gpx", list(zip(LAT + np.cumsum(rng.normal(0, 4e-4, 80)),
+                                                      2.0 + i * 0.03 + np.cumsum(rng.normal(0, 4e-4, 80)))))
+            for i in range(6)]
+
+
+def test_parallel_render_matches_sequential(tmp_path, gpx_dir, monkeypatch):
+    from app import heatmap
+    monkeypatch.setattr(heatmap, "PARALLEL_MIN_TILES", 0)
+    paths = _spread_tracks(gpx_dir)
+    tiles = {}
+    for workers in (1, 2):
+        engine = HeatmapEngine({**make_config(tmp_path / str(workers), min_zoom=10, max_zoom=14),
+                                "performance": {"render_workers": workers}})
+        engine.bulk_ingest(paths)
+        tiles[workers] = {p.relative_to(engine.tiles_dir): p.read_bytes() for p in engine.tiles_dir.rglob("*.png")}
+        assert not list(engine.db_path.parent.glob("render-*"))  # fichiers temporaires supprimés
+        engine.close()
+    assert len(tiles[1]) > 20 and tiles[1] == tiles[2]
+
+
+def test_parallel_render_can_be_cancelled(tmp_path, gpx_dir, monkeypatch):
+    from app import heatmap
+    from app.jobs import JobManager
+    monkeypatch.setattr(heatmap, "PARALLEL_MIN_TILES", 0)
+    # un seul zoom : aucune tuile rendue sur place, toutes passent par les processus
+    engine = HeatmapEngine({**make_config(tmp_path, min_zoom=14, max_zoom=14), "performance": {"render_workers": 2}})
+    engine.bulk_ingest(_spread_tracks(gpx_dir), render=False)
+    jobs = JobManager(lanes=("data",))
+
+    class CancelOnFirstGroup:
+        def __init__(self, job):
+            self.job = job
+
+        def phase(self, *a, **k):
+            self.job.phase(*a, **k)
+
+        def advance(self, n=1, phase=None):
+            jobs.cancel(self.job.id)  # dès le premier groupe rendu par un processus
+            self.job.advance(n, phase)
+
+    job, _ = jobs.submit("x", "x", lambda job: engine.rerender_all(progress=CancelOnFirstGroup(job)))
+    assert job.wait(60) and job.status == "cancelled"
+    assert not list(engine.db_path.parent.glob("render-*"))
+    engine.close()
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, "4", True])
+def test_invalid_render_workers_is_rejected(tmp_path, value):
+    with pytest.raises(ValueError, match="render_workers"):
+        HeatmapEngine({**make_config(tmp_path), "performance": {"render_workers": value}})
+
+
+def test_auto_render_workers(monkeypatch):
+    from app import heatmap
+    monkeypatch.setattr(heatmap, "_available_cpus", lambda: 8)
+    monkeypatch.setattr(heatmap, "_available_memory", lambda: None)
+    assert heatmap.render_workers_from_config(0) == heatmap.MAX_AUTO_WORKERS
+    monkeypatch.setattr(heatmap, "_available_memory", lambda: 450 * 2**20)  # petit NAS : 2 processus
+    assert heatmap.render_workers_from_config(0) == 2
+    monkeypatch.setattr(heatmap, "_available_memory", lambda: 50 * 2**20)
+    assert heatmap.render_workers_from_config(0) == 1
+    assert heatmap.render_workers_from_config(3) == 3  # valeur explicite : respectée

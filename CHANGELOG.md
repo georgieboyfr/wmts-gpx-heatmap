@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+- **Tiles saved as palette PNGs**: a tile only holds the 256 colors of the gradient, so it is now written with 1 byte per pixel instead of 4, pixel-identical (transparency included). PNG encoding is ~10 times faster and dense tiles ~2 times smaller (12 % less disk on the demo data, where many tiles are mostly transparent). Full recompute of the demo data: 31.9 s -> 19.6 s.
+- **Large recomputes on several processes** (`performance.render_workers`, `0` = auto): each process renders a tile and all its descendants, reading the points from a shared memory-mapped file (no copy per process). Auto mode uses the available cores (at most 4) and no more processes than free memory allows (~80 MB each while computing); small updates (fewer than 256 tiles) stay in the main process. Demo data on a 2-vCPU machine: 19.6 s -> 16.6 s; more on a NAS with 4 real cores.
+
 ## 1.0.7 — 2026-10-29
 
 ### Performance

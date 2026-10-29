@@ -22,11 +22,15 @@ import io
 import itertools
 import logging
 import math
+import multiprocessing
 import os
+import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from collections import OrderedDict, defaultdict
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,6 +53,9 @@ PREVIEW_CACHE_BYTES = 64 * 2**20  # mémoire max des sélections de points gard�
 LOAD_CHUNK = 100_000  # points lus par bloc au démarrage
 COORD_SCALE = 1_000_000  # coordonnées en mémoire : entiers 32 bits en microdegrés (~11 cm)
 DEFAULT_SIMPLIFY_M = 1.0  # tolérance de simplification des traces à l'import (mètres)
+PARALLEL_MIN_TILES = 256  # en dessous, rendu dans le processus principal (démarrage des processus évité)
+MAX_AUTO_WORKERS = 4
+WORKER_MEMORY_BUDGET = 200 * 2**20  # mémoire libre exigée par processus de rendu en mode automatique
 
 
 def _file_signature(path):
@@ -145,6 +152,41 @@ def simplify_track(latlon, tolerance_m):
     return np.flatnonzero(keep)
 
 
+def _available_cpus():
+    try:
+        return len(os.sched_getaffinity(0))  # Linux : respecte les cœurs attribués au conteneur
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
+def _available_memory():
+    """Mémoire physique libre en octets, ou None si inconnue (hors Linux/Unix)."""
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def render_workers_from_config(value):
+    """Nombre de processus de rendu : 0 = automatique (cœurs disponibles, 4 au plus, et
+    pas plus que la mémoire libre n'en permet : chaque processus charge numpy, scipy et
+    Pillow, ~80 Mo)."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("Configuration invalide : performance.render_workers doit être un entier >= 0 (0 = automatique)")
+    if value:
+        return value
+    workers = min(_available_cpus(), MAX_AUTO_WORKERS)
+    free = _available_memory()
+    if free is not None:
+        workers = min(workers, free // WORKER_MEMORY_BUDGET)
+    return max(1, workers)
+
+
+def _save_png(img, fp, compress_level):
+    # transparence de chaque entrée de la palette (bloc tRNS du PNG)
+    img.save(fp, format="PNG", compress_level=compress_level, transparency=img.info.get("transparency"))
+
+
 def _make_lut(gradient_stops, n=256):
     stops = sorted(gradient_stops, key=lambda s: s[0])
     fracs = np.array([s[0] for s in stops])
@@ -207,7 +249,21 @@ class RenderParams:
         if k > 0:
             norm = np.log1p(norm * k) / np.log1p(k)
         idx = (norm * 255).astype(np.uint8)
-        return Image.fromarray(self.lut[idx], mode="RGBA")
+        # image à palette : la tuile ne contient que les 256 couleurs de la LUT, donc 1 octet
+        # par pixel au lieu de 4 pour un rendu identique (encodage PNG ~10 fois plus rapide,
+        # fichiers ~2 fois plus petits)
+        img = Image.fromarray(idx, mode="P")
+        img.putpalette(self.palette)
+        img.info["transparency"] = self.alphas
+        return img
+
+    @property
+    def palette(self) -> bytes:
+        return self.lut[:, :3].tobytes()
+
+    @property
+    def alphas(self) -> bytes:
+        return self.lut[:, 3].tobytes()
 
 
 @dataclass(frozen=True, eq=False)
@@ -232,6 +288,7 @@ class HeatmapEngine:
     def __init__(self, config: dict):
         self.params = RenderParams.from_config(config["render"], config.get("color_gradient"))
         self.simplify_m = float((config.get("ingest") or {}).get("simplify_tolerance_m", DEFAULT_SIMPLIFY_M))
+        self.render_workers = render_workers_from_config((config.get("performance") or {}).get("render_workers", 0))
         self.tiles_dir = Path(config["paths"]["tiles"])
         self.db_path = Path(config["paths"]["db"])
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -587,33 +644,50 @@ class HeatmapEngine:
         des points de sa zone, et non de tous ceux de la région, ce qui évite qu'une zone
         très fréquentée ralentisse fortement le calcul aux grands zooms."""
         progress.phase("Calcul des tuiles", len(tiles))
-        pts = self.pts
-        all_idx = _indices(len(pts))
-        selections = {}  # (z, x, y) -> indices des points nécessaires à la tuile
+        workers = self.render_workers
+        if workers <= 1 or len(tiles) < PARALLEL_MIN_TILES:
+            return _render_tile_group(self.pts, params, self.tiles_dir, tiles, progress.advance)
+        return self._render_tiles_parallel(tiles, params, workers, progress)
 
-        def selection(z, x, y):
-            key = (z, x, y)
-            if key not in selections:
-                source = all_idx if z <= params.min_zoom else selection(z - 1, x >> 1, y >> 1)
-                selections[key] = self._select(pts, source, *self._canvas_bounds(params, z, x, y))
-            return selections[key]
+    def _render_tiles_parallel(self, tiles, params, workers, progress):
+        """Répartit le rendu sur plusieurs processus (Python n'exécute qu'un thread à la fois :
+        des threads n'apportent rien ici). Chaque tâche est une tuile « racine » et toutes ses
+        descendantes à rendre, pour garder le filtrage des points par tuile mère. Les points
+        sont écrits une fois en .npy et ouverts en lecture seule (memory-map) par chaque
+        processus : le système partage ces pages en mémoire, sans copie par processus."""
+        # zoom de découpe : le plus petit qui donne assez de tâches pour occuper les processus
+        split = params.min_zoom
+        while split < params.max_zoom and len({_ancestor(t, split) for t in tiles if t[0] >= split}) < 8 * workers:
+            split += 1
+        head = [t for t in tiles if t[0] < split]  # quelques tuiles des petits zooms : sur place
+        groups = defaultdict(list)
+        for t in tiles:
+            if t[0] >= split:
+                groups[_ancestor(t, split)].append(t)
 
-        written = set()
-        current_zoom = None
-        for z, x, y in sorted(tiles):
-            if z != current_zoom:
-                # nouveau zoom : seules les sélections du zoom précédent servent encore
-                for key in [k for k in selections if k[0] < z - 1]:
-                    del selections[key]
-                current_zoom = z
-            out = self.tile_path(z, x, y)
-            img = self._draw_tile(pts, params, z, x, y, selection(z, x, y))
-            if img is None:
-                out.unlink(missing_ok=True)
-            else:
-                self._write_tile(out, img)
-                written.add((z, x, y))
-            progress.advance()
+        written = _render_tile_group(self.pts, params, self.tiles_dir, head, progress.advance)
+        tmp = tempfile.mkdtemp(prefix="render-", dir=self.db_path.parent)
+        try:
+            for name in ("seg", "lat", "lon"):
+                np.save(os.path.join(tmp, f"{name}.npy"), getattr(self.pts, name))
+            # forkserver plutôt que fork : le serveur a déjà des threads (watcher, tâches...)
+            methods = multiprocessing.get_all_start_methods()
+            ctx = multiprocessing.get_context("forkserver" if "forkserver" in methods else "spawn")
+            pool = ProcessPoolExecutor(max_workers=min(workers, len(groups)), mp_context=ctx,
+                                       initializer=_worker_init, initargs=(tmp,))
+            try:
+                pending = {pool.submit(_worker_render, params, str(self.tiles_dir), group): len(group)
+                           for group in groups.values()}
+                while pending:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        written |= future.result()
+                        progress.advance(pending.pop(future))  # lève JobCancelled si annulé
+            finally:
+                # annulation ou erreur : les tâches pas encore commencées sont abandonnées
+                pool.shutdown(wait=True, cancel_futures=True)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
         return written
 
     @staticmethod
@@ -642,7 +716,8 @@ class HeatmapEngine:
             return idx  # pas de copie : les tuiles des petits zooms contiennent souvent tout
         return idx[keep]
 
-    def _draw_tile(self, pts, params, z, x, y, idx):
+    @staticmethod
+    def _draw_tile(pts, params, z, x, y, idx):
         """Dessine une tuile à partir des points déjà sélectionnés pour elle (voir _select)."""
         if len(idx) == 0:
             return None
@@ -650,7 +725,7 @@ class HeatmapEngine:
         pad = params.pad
         canvas_size = TILE_SIZE + 2 * pad
         canvas = np.zeros((canvas_size, canvas_size), dtype=np.float32)
-        px, py = self._lonlat_to_pixel(pts.lon[idx] / COORD_SCALE, pts.lat[idx] / COORD_SCALE, z)
+        px, py = HeatmapEngine._lonlat_to_pixel(pts.lon[idx] / COORD_SCALE, pts.lat[idx] / COORD_SCALE, z)
         lx = px - (x * TILE_SIZE - pad)
         ly = py - (y * TILE_SIZE - pad)
 
@@ -661,7 +736,7 @@ class HeatmapEngine:
             # (boucle, aller-retour...) : il ne faut PAS relier ces deux portions, sous
             # peine de créer une fausse ligne droite
             runs = np.split(g, np.flatnonzero(np.diff(idx[g]) != 1) + 1)
-            self._draw_segment(canvas, [(lx[r], ly[r]) for r in runs], params.line_width_px)
+            HeatmapEngine._draw_segment(canvas, [(lx[r], ly[r]) for r in runs], params.line_width_px)
 
         if params.blur_sigma_px > 0:
             canvas = ndimage.gaussian_filter(canvas, sigma=params.blur_sigma_px, truncate=BLUR_TRUNCATE)
@@ -703,7 +778,7 @@ class HeatmapEngine:
         if img is None:
             return None
         buf = io.BytesIO()
-        img.save(buf, format="PNG", compress_level=1)  # servi en local : vitesse avant taille
+        _save_png(img, buf, compress_level=1)  # servi en local : vitesse avant taille
         return buf.getvalue()
 
     def _preview_selection(self, pts, params, z, x, y):
@@ -738,7 +813,7 @@ class HeatmapEngine:
             return idx
 
     def tile_path(self, z, x, y) -> Path:
-        return self.tiles_dir / str(z) / str(x) / f"{y}.png"
+        return _tile_path(self.tiles_dir, z, x, y)
 
     def get_tile_path(self, z, x, y):
         p = self.tile_path(z, x, y)
@@ -750,9 +825,9 @@ class HeatmapEngine:
         # concurrente lit l'ancienne ou la nouvelle tuile, jamais une tuile à moitié écrite
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
-        # compress_level=6 plutôt qu'optimize=True : ~3 fois plus rapide (optimize essaie
-        # plusieurs réglages par tuile) pour des fichiers à peine plus gros (~3 %)
-        img.save(tmp, format="PNG", compress_level=6)
+        # compress_level=3 : sur une image à palette, presque aussi compact que 6 (~2 %)
+        # et ~2 fois plus rapide ; optimize=True essaierait plusieurs réglages par tuile
+        _save_png(img, tmp, compress_level=3)
         os.replace(tmp, path)
 
     @staticmethod
@@ -831,3 +906,70 @@ class HeatmapEngine:
 
     def failed_files(self):
         return [r[0] for r in self._read("SELECT path FROM ingested_files WHERE ok = 0")]
+
+
+# ---------- rendu d'un groupe de tuiles (processus principal ou processus de rendu) ----------
+
+def _tile_path(tiles_dir, z, x, y) -> Path:
+    return Path(tiles_dir) / str(z) / str(x) / f"{y}.png"
+
+
+def _ancestor(tile, z):
+    tz, x, y = tile
+    return z, x >> (tz - z), y >> (tz - z)
+
+
+def _render_tile_group(pts, params, tiles_dir, tiles, advance=None):
+    """Rend les tuiles zoom par zoom, du plus petit au plus grand. Les points retenus
+    pour une tuile sont filtrés parmi ceux de sa tuile mère au zoom précédent (la zone
+    d'une tuile fille est incluse dans celle de sa mère) : le coût d'une tuile dépend
+    des points de sa zone, et non de tous ceux de la région, ce qui évite qu'une zone
+    très fréquentée ralentisse fortement le calcul aux grands zooms. Retourne les tuiles
+    écrites (non vides)."""
+    all_idx = None
+    selections = {}  # (z, x, y) -> indices des points nécessaires à la tuile
+
+    def selection(z, x, y):
+        nonlocal all_idx
+        key = (z, x, y)
+        if key not in selections:
+            if z <= params.min_zoom:
+                if all_idx is None:
+                    all_idx = _indices(len(pts))
+                source = all_idx
+            else:
+                source = selection(z - 1, x >> 1, y >> 1)
+            selections[key] = HeatmapEngine._select(pts, source, *HeatmapEngine._canvas_bounds(params, z, x, y))
+        return selections[key]
+
+    written = set()
+    current_zoom = None
+    for z, x, y in sorted(tiles):
+        if z != current_zoom:
+            # nouveau zoom : seules les sélections du zoom précédent servent encore
+            for key in [k for k in selections if k[0] < z - 1]:
+                del selections[key]
+            current_zoom = z
+        out = _tile_path(tiles_dir, z, x, y)
+        img = HeatmapEngine._draw_tile(pts, params, z, x, y, selection(z, x, y))
+        if img is None:
+            out.unlink(missing_ok=True)
+        else:
+            HeatmapEngine._write_tile(out, img)
+            written.add((z, x, y))
+        if advance:
+            advance()
+    return written
+
+
+_worker_pts = None
+
+
+def _worker_init(points_dir):
+    global _worker_pts
+    _worker_pts = Points(*(np.load(os.path.join(points_dir, f"{name}.npy"), mmap_mode="r")
+                           for name in ("seg", "lat", "lon")))
+
+
+def _worker_render(params, tiles_dir, tiles):
+    return _render_tile_group(_worker_pts, params, tiles_dir, tiles)

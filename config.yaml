@@ -19,6 +19,12 @@ ingest:
                                 # rendu identique). 0 = garder tous les points. Après un changement :
                                 # « Réindexer tout » pour l'appliquer aux traces déjà importées.
 
+performance:
+  render_workers: 0             # processus de rendu pour les gros recalculs (réindexation, nouveaux réglages,
+                                # premier import) : 0 = automatique (cœurs disponibles, 4 au plus, et pas plus
+                                # que la mémoire libre n'en permet). Chaque processus prend ~80 Mo pendant le
+                                # calcul : mettre 1 sur une machine très juste en RAM.
+
 # Dégradé de couleur (fraction 0-1 -> [R,G,B,A]). Modifiable librement.
 # Ici : style "Strava heatmap" mais en tons bleus (fond sombre recommandé côté carte) :
 # transparent -> bleu marine -> bleu vif -> cyan -> blanc pour les zones les plus fréquentées.

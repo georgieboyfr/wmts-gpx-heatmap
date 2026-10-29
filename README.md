@@ -49,7 +49,7 @@ A ready-to-use image is published for Intel/AMD and ARM machines: **`ghcr.io/geo
 ```yaml
 services:
   wmts-gpx-heatmap:
-    image: ghcr.io/georgieboyfr/wmts-gpx-heatmap:1.0.7
+    image: ghcr.io/georgieboyfr/wmts-gpx-heatmap:1.0.8
     container_name: wmts-gpx-heatmap
     restart: unless-stopped
     user: "1000:1000"                    # owner of the data folders (`id` on the host; often 1026:100 on Synology)
@@ -249,7 +249,7 @@ The session token is stored in the `garmin_tokens` volume (a remembered password
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Ideas for future work, with the measurements behind them, are collected in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License
 

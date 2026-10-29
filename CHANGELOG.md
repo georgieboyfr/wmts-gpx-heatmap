@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.8 — 2026-10-29
 
 ### Performance
 - **Tiles saved as palette PNGs**: a tile only holds the 256 colors of the gradient, so it is now written with 1 byte per pixel instead of 4, pixel-identical (transparency included). PNG encoding is ~10 times faster and dense tiles ~2 times smaller (12 % less disk on the demo data, where many tiles are mostly transparent). Full recompute of the demo data: 31.9 s -> 19.6 s.

@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="wmts-gpx-heatmap" \
-      org.opencontainers.image.version="1.0.7"
+      org.opencontainers.image.version="1.0.8"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1

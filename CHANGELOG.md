@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.6 — 2026-10-29
 
 ### Admin
 - The admin interface is available in English and French: it follows the browser language, and a FR / EN switch in the top bar remembers the choice. Task labels, phases and results sent by the server are translated too; error messages coming from the server stay in French.

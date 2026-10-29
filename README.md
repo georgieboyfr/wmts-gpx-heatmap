@@ -78,7 +78,7 @@ The repository's [`docker-compose.yml`](docker-compose.yml) is the same file, re
 
 ## Administration (`/admin`)
 
-Open **`http://<nas>:8088/admin`** and sign in with the `ADMIN_TOKEN` from `.env` (the admin is disabled when it is not set). Everything is done from there, no manual `POST` needed:
+Open **`http://<nas>:8088/admin`** and sign in with the `ADMIN_TOKEN` from `.env` (the admin is disabled when it is not set). The interface is available in English and French (it follows the browser language; the FR / EN switch in the top bar keeps your choice). Everything is done from there, no manual `POST` needed:
 
 - **Dashboard** — files, points, tiles, Garmin status; one-click *Rescan folder*, *Recompute tiles*, *Sync Garmin*, *Reindex everything*. Every long operation runs as a background **task** with live progress per phase (files read, tiles computed, ETA), a **Cancel** button and a history.
 - **Garmin** — connect your account (email + password, then the **MFA code** if Garmin asks for one), see its status, last/next sync, sync now, disconnect. When connecting you choose whether the password is **remembered** (stored on the server, so the session can be renewed on its own) or **not** (recommended: only the session token is kept; reconnect from the admin if it ever expires). Auto-sync on/off, interval, history depth and batch size are editable live.

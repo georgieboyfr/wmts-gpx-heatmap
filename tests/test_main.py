@@ -75,6 +75,7 @@ def test_tiles_kvp_restful_and_etag(main, client, tmp_path):
 def test_admin_page_is_public_but_api_is_not(client):
     assert client.get("/admin").status_code == 200
     assert client.get("/admin/static/admin.js").status_code == 200
+    assert client.get("/admin/static/i18n.js").status_code == 200
     assert client.get("/admin/api/session").json() == {"admin_enabled": True, "authenticated": False}
     assert client.get("/admin/api/status").status_code == 401
     assert client.post("/admin/rerender").status_code == 401

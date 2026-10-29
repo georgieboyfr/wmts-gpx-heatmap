@@ -12,18 +12,20 @@
 <!-- ===== Connexion ===== -->
 <section id="login-view" class="login-view" hidden>
   <form id="login-form" class="card login-card">
-    <h1>Heatmap GPX</h1>
-    <p class="muted">Administration</p>
-    <div id="login-disabled" class="notice warn" hidden>
-      L'administration est désactivée : définis <code>ADMIN_TOKEN</code> dans le fichier <code>.env</code>
-      puis redémarre le conteneur.
+    <div class="row between">
+      <h1>Heatmap GPX</h1>
+      <div class="lang-switch" role="group" aria-label="Langue / Language">
+        <button type="button" data-lang="fr">FR</button><button type="button" data-lang="en">EN</button>
+      </div>
     </div>
+    <p class="muted" data-i18n="login.subtitle">Administration</p>
+    <div id="login-disabled" class="notice warn" hidden data-i18n="login.disabled"></div>
     <label class="field">
-      <span>Jeton d'administration</span>
+      <span data-i18n="login.token">Jeton d'administration</span>
       <input id="login-token" type="password" autocomplete="current-password" required>
     </label>
     <p id="login-error" class="error-text" hidden></p>
-    <button class="btn primary" type="submit">Se connecter</button>
+    <button class="btn primary" type="submit" data-i18n="login.submit">Se connecter</button>
   </form>
 </section>
 
@@ -38,15 +40,18 @@
       </div>
     </div>
     <nav class="tabs" role="tablist">
-      <button role="tab" data-tab="dashboard" class="active">Tableau de bord</button>
-      <button role="tab" data-tab="garmin">Garmin <span id="garmin-tab-dot" class="dot"></span></button>
-      <button role="tab" data-tab="data">Données</button>
-      <button role="tab" data-tab="render">Rendu</button>
-      <button role="tab" data-tab="logs">Journal</button>
+      <button role="tab" data-tab="dashboard" class="active" data-i18n="tab.dashboard">Tableau de bord</button>
+      <button role="tab" data-tab="garmin"><span data-i18n="tab.garmin">Garmin</span> <span id="garmin-tab-dot" class="dot"></span></button>
+      <button role="tab" data-tab="data" data-i18n="tab.data">Données</button>
+      <button role="tab" data-tab="render" data-i18n="tab.render">Rendu</button>
+      <button role="tab" data-tab="logs" data-i18n="tab.logs">Journal</button>
     </nav>
     <div class="topbar-actions">
+      <div class="lang-switch" role="group" aria-label="Langue / Language">
+        <button type="button" data-lang="fr">FR</button><button type="button" data-lang="en">EN</button>
+      </div>
       <a id="caps-link" class="btn ghost small" target="_blank" rel="noopener">GetCapabilities</a>
-      <button id="logout-btn" class="btn ghost small">Déconnexion</button>
+      <button id="logout-btn" class="btn ghost small" data-i18n="top.logout">Déconnexion</button>
     </div>
   </header>
 
@@ -57,27 +62,27 @@
 
       <div class="grid-2">
         <div class="card">
-          <h2>Actions</h2>
+          <h2 data-i18n="dash.actions">Actions</h2>
           <div class="actions-list">
             <div class="action-row">
-              <div><strong>Rescanner le dossier</strong>
-                <p class="muted small">Importe les GPX nouveaux ou modifiés, retire ceux qui ont été supprimés.</p></div>
-              <button class="btn" data-action="rescan">Rescanner</button>
+              <div><strong data-i18n="dash.rescan.title">Rescanner le dossier</strong>
+                <p class="muted small" data-i18n="dash.rescan.desc">Importe les GPX nouveaux ou modifiés, retire ceux qui ont été supprimés.</p></div>
+              <button class="btn" data-action="rescan" data-i18n="dash.rescan.btn">Rescanner</button>
             </div>
             <div class="action-row">
-              <div><strong>Recalculer les tuiles</strong>
-                <p class="muted small">Regénère toutes les tuiles avec les réglages de rendu actuels.</p></div>
-              <button class="btn" data-action="rerender">Recalculer</button>
+              <div><strong data-i18n="dash.rerender.title">Recalculer les tuiles</strong>
+                <p class="muted small" data-i18n="dash.rerender.desc">Regénère toutes les tuiles avec les réglages de rendu actuels.</p></div>
+              <button class="btn" data-action="rerender" data-i18n="dash.rerender.btn">Recalculer</button>
             </div>
             <div class="action-row">
-              <div><strong>Synchroniser Garmin</strong>
-                <p class="muted small">Récupère tout de suite les nouvelles activités.</p></div>
-              <button class="btn" data-action="garmin-sync">Synchroniser</button>
+              <div><strong data-i18n="dash.sync.title">Synchroniser Garmin</strong>
+                <p class="muted small" data-i18n="dash.sync.desc">Récupère tout de suite les nouvelles activités.</p></div>
+              <button class="btn" data-action="garmin-sync" data-i18n="dash.sync.btn">Synchroniser</button>
             </div>
             <div class="action-row">
-              <div><strong>Réindexer tout</strong>
-                <p class="muted small">Vide la base, réimporte tout le dossier et recalcule toutes les tuiles.</p></div>
-              <button class="btn danger" data-action="reindex">Réindexer</button>
+              <div><strong data-i18n="dash.reindex.title">Réindexer tout</strong>
+                <p class="muted small" data-i18n="dash.reindex.desc">Vide la base, réimporte tout le dossier et recalcule toutes les tuiles.</p></div>
+              <button class="btn danger" data-action="reindex" data-i18n="dash.reindex.btn">Réindexer</button>
             </div>
           </div>
         </div>
@@ -90,15 +95,15 @@
       </div>
 
       <div class="card">
-        <h2>Tâches en cours</h2>
+        <h2 data-i18n="dash.active">Tâches en cours</h2>
         <div id="active-jobs"></div>
       </div>
 
       <div class="card">
-        <h2>Historique</h2>
+        <h2 data-i18n="dash.history">Historique</h2>
         <div class="table-wrap">
           <table class="table">
-            <thead><tr><th>Tâche</th><th>Statut</th><th>Début</th><th>Durée</th><th>Résultat</th></tr></thead>
+            <thead><tr><th data-i18n="dash.col.task">Tâche</th><th data-i18n="dash.col.status">Statut</th><th data-i18n="dash.col.start">Début</th><th data-i18n="dash.col.duration">Durée</th><th data-i18n="dash.col.result">Résultat</th></tr></thead>
             <tbody id="history-body"></tbody>
           </table>
         </div>
@@ -109,50 +114,50 @@
     <section class="tab-panel" data-panel="garmin" hidden>
       <div class="grid-2">
         <div class="card">
-          <h2>Compte</h2>
+          <h2 data-i18n="garmin.account">Compte</h2>
           <div id="garmin-status-info"></div>
           <div id="garmin-status-job"></div>
           <div id="garmin-status-actions" class="row gap wrap"></div>
         </div>
 
         <div class="card" id="garmin-login-card" hidden>
-          <h2 id="garmin-login-title">Connecter un compte</h2>
+          <h2 id="garmin-login-title" data-i18n="garmin.login_title">Connecter un compte</h2>
           <form id="garmin-login-form">
-            <label class="field"><span>Email Garmin Connect</span>
+            <label class="field"><span data-i18n="garmin.email">Email Garmin Connect</span>
               <input id="garmin-email" type="email" autocomplete="username" required></label>
-            <label class="field"><span>Mot de passe</span>
+            <label class="field"><span data-i18n="garmin.password">Mot de passe</span>
               <input id="garmin-password" type="password" autocomplete="current-password" required></label>
             <fieldset class="choice">
-              <legend>Mot de passe</legend>
+              <legend data-i18n="garmin.pw_legend">Mot de passe</legend>
               <label class="choice-item">
                 <input type="radio" name="remember" value="no" checked>
-                <span><strong>Ne pas le mémoriser</strong> <em class="badge">recommandé</em>
-                  <small class="muted">Il sert uniquement à obtenir un jeton de session, puis il est oublié.
+                <span><strong data-i18n="garmin.pw_forget_title">Ne pas le mémoriser</strong> <em class="badge" data-i18n="garmin.recommended">recommandé</em>
+                  <small class="muted" data-i18n="garmin.pw_forget_desc">Il sert uniquement à obtenir un jeton de session, puis il est oublié.
                   Si la session expire un jour, il faudra te reconnecter ici.</small></span>
               </label>
               <label class="choice-item">
                 <input type="radio" name="remember" value="yes">
-                <span><strong>Le mémoriser sur le serveur</strong>
-                  <small class="muted">Enregistré en clair dans le dossier des jetons (lisible du seul service),
+                <span><strong data-i18n="garmin.pw_keep_title">Le mémoriser sur le serveur</strong>
+                  <small class="muted" data-i18n="garmin.pw_keep_desc">Enregistré en clair dans le dossier des jetons (lisible du seul service),
                   pour te reconnecter tout seul si la session expire. Un code MFA redemandé
                   nécessitera quand même une reconnexion ici.</small></span>
               </label>
             </fieldset>
             <p id="garmin-login-error" class="error-text" hidden></p>
             <div class="row gap">
-              <button class="btn primary" type="submit" id="garmin-login-btn">Se connecter</button>
-              <button class="btn ghost" type="button" id="garmin-login-cancel" hidden>Annuler</button>
+              <button class="btn primary" type="submit" id="garmin-login-btn" data-i18n="login.submit">Se connecter</button>
+              <button class="btn ghost" type="button" id="garmin-login-cancel" hidden data-i18n="garmin.cancel">Annuler</button>
             </div>
           </form>
         </div>
 
         <div class="card" id="garmin-mfa-card" hidden>
-          <h2>Code de vérification</h2>
-          <p>Garmin a envoyé un code de vérification (email ou application). Saisis-le pour terminer la connexion.</p>
+          <h2 data-i18n="garmin.mfa_title">Code de vérification</h2>
+          <p data-i18n="garmin.mfa_desc">Garmin a envoyé un code de vérification (email ou application). Saisis-le pour terminer la connexion.</p>
           <form id="garmin-mfa-form" class="row gap wrap">
             <input id="garmin-mfa-code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" required class="mfa-input">
-            <button class="btn primary" type="submit">Valider</button>
-            <button class="btn ghost" type="button" id="garmin-mfa-cancel">Annuler</button>
+            <button class="btn primary" type="submit" data-i18n="garmin.mfa_submit">Valider</button>
+            <button class="btn ghost" type="button" id="garmin-mfa-cancel" data-i18n="garmin.cancel">Annuler</button>
           </form>
           <p class="muted small" id="garmin-mfa-timer"></p>
           <p id="garmin-mfa-error" class="error-text" hidden></p>
@@ -160,23 +165,23 @@
       </div>
 
       <div class="card">
-        <h2>Synchronisation automatique</h2>
+        <h2 data-i18n="gs.title">Synchronisation automatique</h2>
         <form id="garmin-settings-form" class="settings-grid">
           <label class="switch-field">
             <input type="checkbox" id="gs-enabled">
             <span class="switch" aria-hidden="true"></span>
-            <span>Synchronisation automatique activée</span>
+            <span data-i18n="gs.enabled">Synchronisation automatique activée</span>
           </label>
-          <label class="field"><span>Intervalle (minutes)</span>
+          <label class="field"><span data-i18n="gs.interval">Intervalle (minutes)</span>
             <input type="number" id="gs-interval" min="5" max="10080" required></label>
-          <label class="field"><span>Profondeur d'historique au premier import (jours)</span>
+          <label class="field"><span data-i18n="gs.lookback">Profondeur d'historique au premier import (jours)</span>
             <input type="number" id="gs-lookback" min="1" max="36500" required></label>
-          <label class="field"><span>Taille des lots d'ingestion</span>
+          <label class="field"><span data-i18n="gs.batch">Taille des lots d'ingestion</span>
             <input type="number" id="gs-batch" min="0" max="10000" required>
-            <small class="muted">0 = un seul import à la fin du téléchargement ; sinon, import progressif par lots.</small></label>
+            <small class="muted" data-i18n="gs.batch_hint">0 = un seul import à la fin du téléchargement ; sinon, import progressif par lots.</small></label>
           <div class="row gap full">
-            <button class="btn primary" type="submit">Enregistrer</button>
-            <button class="btn ghost" type="button" id="gs-reset">Revenir à config.yaml</button>
+            <button class="btn primary" type="submit" data-i18n="gs.save">Enregistrer</button>
+            <button class="btn ghost" type="button" id="gs-reset" data-i18n="common.back_to_config">Revenir à config.yaml</button>
             <span class="muted small" id="gs-source"></span>
           </div>
         </form>
@@ -186,40 +191,40 @@
     <!-- ----- Données ----- -->
     <section class="tab-panel" data-panel="data" hidden>
       <div class="card">
-        <h2>Ajouter des traces</h2>
+        <h2 data-i18n="data.add">Ajouter des traces</h2>
         <label class="dropzone" id="dropzone">
           <input type="file" id="upload-input" accept=".gpx" multiple hidden>
-          <strong>Glisse des fichiers .gpx ici</strong>
-          <span class="muted">ou clique pour les choisir — ils sont importés automatiquement</span>
+          <strong data-i18n="data.drop">Glisse des fichiers .gpx ici</strong>
+          <span class="muted" data-i18n="data.drop_hint">ou clique pour les choisir — ils sont importés automatiquement</span>
         </label>
         <ul class="upload-list" id="upload-list"></ul>
       </div>
 
       <div class="card">
         <div class="card-head">
-          <h2>Fichiers</h2>
+          <h2 data-i18n="data.files">Fichiers</h2>
           <div class="row gap wrap">
-            <input type="search" id="files-search" placeholder="Rechercher un fichier…">
+            <input type="search" id="files-search" placeholder="Rechercher un fichier…" data-i18n-placeholder="data.search">
             <select id="files-status">
-              <option value="all">Tous</option>
-              <option value="ok">Importés</option>
-              <option value="failed">En erreur</option>
-              <option value="legacy">Ancienne version</option>
+              <option value="all" data-i18n="data.filter.all">Tous</option>
+              <option value="ok" data-i18n="data.filter.ok">Importés</option>
+              <option value="failed" data-i18n="data.filter.failed">En erreur</option>
+              <option value="legacy" data-i18n="data.filter.legacy">Ancienne version</option>
             </select>
-            <button class="btn" id="retry-all-btn" hidden>Réessayer les fichiers en erreur</button>
+            <button class="btn" id="retry-all-btn" hidden data-i18n="data.retry_all_short">Réessayer les fichiers en erreur</button>
           </div>
         </div>
         <div class="table-wrap">
           <table class="table">
-            <thead><tr><th>Fichier</th><th>Statut</th><th class="num">Points</th><th class="num">Taille</th><th>Importé</th><th></th></tr></thead>
+            <thead><tr><th data-i18n="data.col.file">Fichier</th><th data-i18n="data.col.status">Statut</th><th class="num" data-i18n="data.col.points">Points</th><th class="num" data-i18n="data.col.size">Taille</th><th data-i18n="data.col.imported">Importé</th><th></th></tr></thead>
             <tbody id="files-body"></tbody>
           </table>
         </div>
         <div class="pager">
           <span class="muted small" id="files-count"></span>
           <div class="row gap">
-            <button class="btn ghost small" id="files-prev">Précédent</button>
-            <button class="btn ghost small" id="files-next">Suivant</button>
+            <button class="btn ghost small" id="files-prev" data-i18n="data.prev">Précédent</button>
+            <button class="btn ghost small" id="files-next" data-i18n="data.next">Suivant</button>
           </div>
         </div>
       </div>
@@ -229,47 +234,47 @@
     <section class="tab-panel" data-panel="render" hidden>
       <div class="render-layout">
         <form class="card render-form" id="render-form">
-          <h2>Réglages de rendu</h2>
+          <h2 data-i18n="render.title">Réglages de rendu</h2>
           <div class="settings-grid two">
-            <label class="field"><span>Zoom minimal</span><input type="number" id="r-min_zoom" min="0" max="24" required></label>
-            <label class="field"><span>Zoom maximal</span><input type="number" id="r-max_zoom" min="0" max="24" required></label>
+            <label class="field"><span data-i18n="render.min_zoom">Zoom minimal</span><input type="number" id="r-min_zoom" min="0" max="24" required></label>
+            <label class="field"><span data-i18n="render.max_zoom">Zoom maximal</span><input type="number" id="r-max_zoom" min="0" max="24" required></label>
           </div>
           <div class="slider-field" data-key="line_width_px" data-min="1" data-max="12" data-step="1">
-            <span>Épaisseur du trait <small class="muted">px</small></span></div>
+            <span data-i18n="render.line_width">Épaisseur du trait <small class="muted">px</small></span></div>
           <div class="slider-field" data-key="blur_sigma_px" data-min="0" data-max="12" data-step="0.5">
-            <span>Flou (effet « glow ») <small class="muted">px</small></span></div>
+            <span data-i18n="render.blur">Flou (effet « glow ») <small class="muted">px</small></span></div>
           <div class="slider-field" data-key="color_saturation" data-min="1" data-max="100" data-step="1">
-            <span>Saturation <small class="muted">passages pour la couleur maximale</small></span></div>
+            <span data-i18n="render.saturation">Saturation <small class="muted">passages pour la couleur maximale</small></span></div>
           <div class="slider-field" data-key="contrast_boost" data-min="0" data-max="200" data-step="1">
-            <span>Contraste des faibles densités <small class="muted">0 = linéaire</small></span></div>
+            <span data-i18n="render.contrast">Contraste des faibles densités <small class="muted">0 = linéaire</small></span></div>
 
-          <h3>Dégradé de couleurs</h3>
+          <h3 data-i18n="render.gradient">Dégradé de couleurs</h3>
           <div class="gradient-bar" id="gradient-bar"></div>
           <div id="gradient-stops"></div>
-          <button type="button" class="btn ghost small" id="add-stop">+ Ajouter un palier</button>
+          <button type="button" class="btn ghost small" id="add-stop" data-i18n="render.add_stop">+ Ajouter un palier</button>
 
           <p id="render-error" class="error-text" hidden></p>
           <div class="row gap wrap sticky-actions">
-            <button class="btn primary" type="submit">Appliquer et recalculer</button>
-            <button class="btn ghost" type="button" id="render-revert">Annuler les modifications</button>
-            <button class="btn ghost" type="button" id="render-reset">Revenir à config.yaml</button>
+            <button class="btn primary" type="submit" data-i18n="render.apply">Appliquer et recalculer</button>
+            <button class="btn ghost" type="button" id="render-revert" data-i18n="render.revert">Annuler les modifications</button>
+            <button class="btn ghost" type="button" id="render-reset" data-i18n="common.back_to_config">Revenir à config.yaml</button>
           </div>
           <p class="muted small" id="render-source"></p>
         </form>
 
         <div class="card map-card">
           <div class="card-head">
-            <h2>Aperçu</h2>
+            <h2 data-i18n="map.title">Aperçu</h2>
             <div class="segmented" role="radiogroup">
-              <label><input type="radio" name="map-layer" value="preview" checked><span>Réglages en cours</span></label>
-              <label><input type="radio" name="map-layer" value="published"><span>Tuiles publiées</span></label>
+              <label><input type="radio" name="map-layer" value="preview" checked><span data-i18n="map.preview">Réglages en cours</span></label>
+              <label><input type="radio" name="map-layer" value="published"><span data-i18n="map.published">Tuiles publiées</span></label>
             </div>
           </div>
           <div class="map-wrap">
             <div id="map"></div>
             <div id="map-status" class="map-status" hidden role="status" aria-live="polite"></div>
           </div>
-          <p class="muted small">L'aperçu est calculé à la volée avec les réglages du formulaire, sans rien modifier.
+          <p class="muted small" data-i18n="map.hint">L'aperçu est calculé à la volée avec les réglages du formulaire, sans rien modifier.
             « Appliquer » enregistre les réglages et recalcule toutes les tuiles.</p>
         </div>
       </div>
@@ -279,16 +284,16 @@
     <section class="tab-panel" data-panel="logs" hidden>
       <div class="card">
         <div class="card-head">
-          <h2>Journal</h2>
+          <h2 data-i18n="logs.title">Journal</h2>
           <div class="row gap wrap">
             <select id="log-level">
-              <option value="INFO">Info et plus</option>
-              <option value="WARNING">Avertissements et erreurs</option>
-              <option value="ERROR">Erreurs</option>
+              <option value="INFO" data-i18n="logs.info">Info et plus</option>
+              <option value="WARNING" data-i18n="logs.warning">Avertissements et erreurs</option>
+              <option value="ERROR" data-i18n="logs.error">Erreurs</option>
             </select>
-            <input type="search" id="log-filter" placeholder="Filtrer…">
-            <label class="row gap small"><input type="checkbox" id="log-pause"> Pause</label>
-            <button class="btn ghost small" id="log-clear">Vider l'affichage</button>
+            <input type="search" id="log-filter" placeholder="Filtrer…" data-i18n-placeholder="logs.filter">
+            <label class="row gap small"><input type="checkbox" id="log-pause"> <span data-i18n="logs.pause">Pause</span></label>
+            <button class="btn ghost small" id="log-clear" data-i18n="logs.clear">Vider l'affichage</button>
           </div>
         </div>
         <div class="log-view" id="log-view"></div>
@@ -302,8 +307,8 @@
     <h2 id="confirm-title"></h2>
     <p id="confirm-message"></p>
     <div class="row gap end">
-      <button class="btn ghost" value="cancel">Annuler</button>
-      <button class="btn primary" value="ok" id="confirm-ok">Confirmer</button>
+      <button class="btn ghost" value="cancel" data-i18n="dialog.cancel">Annuler</button>
+      <button class="btn primary" value="ok" id="confirm-ok" data-i18n="dialog.confirm">Confirmer</button>
     </div>
   </form>
 </dialog>
@@ -311,6 +316,7 @@
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/admin/static/i18n.js"></script>
 <script src="/admin/static/admin.js"></script>
 </body>
 </html>

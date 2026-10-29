@@ -61,6 +61,13 @@ a { color: var(--accent); }
 .row.gap { gap: 8px; }
 .row.wrap { flex-wrap: wrap; }
 .row.end { justify-content: flex-end; }
+.row.between { justify-content: space-between; gap: 8px; }
+.lang-switch { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; align-self: center; }
+.lang-switch button {
+  border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 12px; font-weight: 600;
+  padding: 4px 8px; cursor: pointer;
+}
+.lang-switch button.active { background: var(--accent-soft); color: var(--accent); }
 .full { grid-column: 1 / -1; }
 
 /* ----- boutons & champs ----- */

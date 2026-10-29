@@ -25,7 +25,7 @@ import os
 import sqlite3
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,6 +44,7 @@ TILE_SIZE = 256
 BLUR_TRUNCATE = 4.0  # rayon du noyau gaussien, en sigmas (valeur par défaut de scipy)
 MAX_LAT = 85.05
 FILE_STATUS = {1: "ok", 0: "failed", 2: "legacy"}
+PREVIEW_CACHE_SIZE = 512  # sélections de points gardées pour l'aperçu de l'admin
 
 
 def _file_signature(path):
@@ -107,6 +108,18 @@ def _make_lut(gradient_stops, n=256):
     return lut
 
 
+def _single_pass_peak(line_width, sigma):
+    """Intensité au centre d'un passage isolé (trait droit) après le flou. Le flou étale
+    le trait et abaisse fortement ce pic (~0,38 pour 2 px et sigma 2) : sans en tenir
+    compte, un passage unique resterait terne quel que soit le contraste choisi."""
+    if sigma <= 0:
+        return 1.0
+    radius = int(math.ceil(BLUR_TRUNCATE * sigma)) + 1
+    profile = np.zeros(line_width + 2 * radius)
+    profile[radius:radius + line_width] = 1
+    return float(ndimage.gaussian_filter1d(profile, sigma, truncate=BLUR_TRUNCATE).max())
+
+
 @dataclass(frozen=True, eq=False)
 class RenderParams:
     """Réglages de rendu validés, figés : modifiables à chaud en remplaçant l'objet."""
@@ -114,7 +127,7 @@ class RenderParams:
     max_zoom: int
     line_width_px: int
     blur_sigma_px: float
-    vmax: float
+    vmax: float  # intensité (après flou) du rouge plein : color_saturation passages
     contrast_boost: float
     lut: np.ndarray
     pad: int
@@ -129,7 +142,7 @@ class RenderParams:
             max_zoom=render["max_zoom"],
             line_width_px=line_width,
             blur_sigma_px=sigma,
-            vmax=float(render.get("color_saturation", 6.0)),
+            vmax=float(render.get("color_saturation", 6.0)) * _single_pass_peak(line_width, sigma),
             contrast_boost=float(render.get("contrast_boost", 9.0)),
             lut=_make_lut(gradient),
             # marge (px) autour de chaque tuile : le trait et le flou débordent jusqu'à cette
@@ -179,6 +192,8 @@ class HeatmapEngine:
         self._load_points()
         self._bounds_cache = (None, None)
         self._tile_count_cache = (0.0, 0)
+        self._preview_lock = threading.Lock()
+        self._preview_cache = (None, OrderedDict())  # ((points, marge), {(z, x, y): indices})
 
     def close(self):
         with self._lock, self._read_lock:
@@ -547,11 +562,9 @@ class HeatmapEngine:
             )
             keep[:-1] |= crossing
             keep[1:] |= crossing
+        if keep.all():
+            return idx  # pas de copie : les tuiles des petits zooms contiennent souvent tout
         return idx[keep]
-
-    def _tile_image(self, pts, params, z, x, y, candidates):
-        """Image RGBA d'une tuile, ou None si aucune trace ne la touche."""
-        return self._draw_tile(pts, params, z, x, y, self._select(pts, candidates, *self._canvas_bounds(params, z, x, y)))
 
     def _draw_tile(self, pts, params, z, x, y, idx):
         """Dessine une tuile à partir des points déjà sélectionnés pour elle (voir _select)."""
@@ -610,12 +623,40 @@ class HeatmapEngine:
         pts = self.pts
         if not params.min_zoom <= z <= params.max_zoom or not len(pts):
             return None
-        img = self._tile_image(pts, params, z, x, y, np.arange(len(pts)))
+        img = self._draw_tile(pts, params, z, x, y, self._preview_selection(pts, params, z, x, y))
         if img is None:
             return None
         buf = io.BytesIO()
-        img.save(buf, format="PNG")
+        img.save(buf, format="PNG", compress_level=1)  # servi en local : vitesse avant taille
         return buf.getvalue()
+
+    def _preview_selection(self, pts, params, z, x, y):
+        """Points nécessaires à une tuile d'aperçu, filtrés depuis ceux de sa tuile mère
+        comme dans _render_tiles. Les sélections sont gardées entre les requêtes (elles
+        ne dépendent que des points et de la marge) : un déplacement de la carte ou un
+        nouveau réglage n'ont plus à parcourir tous les points pour chaque tuile. Le verrou
+        évite que les tuiles affichées en même temps recalculent chacune leurs ancêtres."""
+        with self._preview_lock:
+            key, cache = self._preview_cache
+            if key != (pts, params.pad):
+                cache = OrderedDict()
+                self._preview_cache = ((pts, params.pad), cache)
+            missing = []
+            tile = (z, x, y)
+            while tile not in cache and tile[0] > params.min_zoom:
+                missing.append(tile)
+                tile = (tile[0] - 1, tile[1] >> 1, tile[2] >> 1)
+            if tile in cache:
+                idx = cache[tile]
+                cache.move_to_end(tile)
+            else:
+                missing.append(tile)
+                idx = np.arange(len(pts))
+            for tile in reversed(missing):
+                idx = cache[tile] = self._select(pts, idx, *self._canvas_bounds(params, *tile))
+            while len(cache) > PREVIEW_CACHE_SIZE:
+                cache.popitem(last=False)
+            return idx
 
     def tile_path(self, z, x, y) -> Path:
         return self.tiles_dir / str(z) / str(x) / f"{y}.png"

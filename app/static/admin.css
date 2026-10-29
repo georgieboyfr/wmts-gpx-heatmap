@@ -223,7 +223,19 @@ main { max-width: 1280px; margin: 0 auto; padding: 20px; }
 .render-layout { display: grid; grid-template-columns: minmax(320px, 400px) 1fr; gap: 16px; align-items: start; }
 .render-form { position: relative; }
 .map-card { position: sticky; top: 76px; }
-#map { height: min(70vh, 640px); border-radius: 8px; border: 1px solid var(--border); margin-bottom: 8px; background: #0b0f16; }
+#map { height: min(70vh, 640px); border-radius: 8px; border: 1px solid var(--border); background: #0b0f16; }
+.map-wrap { position: relative; margin-bottom: 8px; }
+.map-status {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 1000; pointer-events: none;
+  display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px;
+  background: rgba(14, 19, 26, .85); color: #e6ebf2; font-size: 13px; white-space: nowrap;
+}
+.map-status .spinner {
+  width: 12px; height: 12px; border-radius: 50%; border: 2px solid rgba(255, 255, 255, .3); border-top-color: #fff;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .map-status .spinner { animation-duration: 2.4s; } }
 /* fond OpenStreetMap assombri : la heatmap se lit mieux sur fond sombre */
 .basemap-dark { filter: invert(1) hue-rotate(180deg) brightness(.85) contrast(.9) saturate(.6); }
 .gradient-bar {

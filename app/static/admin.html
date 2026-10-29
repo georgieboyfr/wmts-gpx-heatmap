@@ -240,7 +240,7 @@
             <span>Flou (effet « glow ») <small class="muted">px</small></span></div>
           <div class="slider-field" data-key="color_saturation" data-min="1" data-max="100" data-step="1">
             <span>Saturation <small class="muted">passages pour la couleur maximale</small></span></div>
-          <div class="slider-field" data-key="contrast_boost" data-min="0" data-max="100" data-step="1">
+          <div class="slider-field" data-key="contrast_boost" data-min="0" data-max="200" data-step="1">
             <span>Contraste des faibles densités <small class="muted">0 = linéaire</small></span></div>
 
           <h3>Dégradé de couleurs</h3>
@@ -265,7 +265,10 @@
               <label><input type="radio" name="map-layer" value="published"><span>Tuiles publiées</span></label>
             </div>
           </div>
-          <div id="map"></div>
+          <div class="map-wrap">
+            <div id="map"></div>
+            <div id="map-status" class="map-status" hidden role="status" aria-live="polite"></div>
+          </div>
           <p class="muted small">L'aperçu est calculé à la volée avec les réglages du formulaire, sans rien modifier.
             « Appliquer » enregistre les réglages et recalcule toutes les tuiles.</p>
         </div>

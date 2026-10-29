@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.5 — 2026-10-29
+
+### Fixes
+- Single passes rendered dull and semi-transparent whatever the contrast setting: the blur spreads the line and lowered its peak intensity (to ~0.38 with a 2 px line and a blur of 2), so `color_saturation` passes never actually reached the top of the gradient. Intensities are now normalized so that one isolated pass counts as 1 after the blur. **Tiles look brighter: run a full tile recompute after upgrading** (or lower `color_saturation` / `contrast_boost` to keep the previous look). The contrast slider now goes up to 200.
+
+### Admin
+- Render preview: much faster when moving the map or changing a setting (point selections are cached per tile and filtered from the parent tile, as for regular rendering), and a banner on the map shows tiles being computed (`n/total`) or that the current zoom is outside the rendered range.
+
 ## 1.0.4 — 2026-10-28
 
 ### Performance

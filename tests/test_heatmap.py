@@ -186,6 +186,26 @@ def test_preview_uses_candidate_params_without_writing(engine, config, gpx_dir):
     assert engine.render_preview(5, 0, 0, thick) is None  # hors plage de zoom
 
 
+def test_preview_follows_point_changes(engine, gpx_dir):
+    tile = mercantile.tile(2.005, LAT, 14)
+    engine.bulk_ingest([write_gpx(gpx_dir / "a.gpx", [(LAT, 2.0), (LAT, 2.01)])])
+    first = engine.render_preview(14, tile.x, tile.y, engine.params)
+    assert engine.render_preview(14, tile.x, tile.y, engine.params) == first  # sélection en cache
+    engine.bulk_ingest([write_gpx(gpx_dir / "b.gpx", [(LAT, 2.0), (LAT, 2.01)])])  # 2e passage
+    assert engine.render_preview(14, tile.x, tile.y, engine.params) != first
+
+
+@pytest.mark.parametrize("width, sigma", [(2, 2), (3, 4), (6, 0)])
+def test_single_pass_reaches_saturation_despite_blur(tmp_path, gpx_dir, width, sigma):
+    # color_saturation = 1 : un passage isolé doit atteindre le haut du dégradé, quel que
+    # soit l'étalement du trait par le flou
+    engine = HeatmapEngine(make_config(tmp_path, line_width_px=width, blur_sigma_px=sigma,
+                                       color_saturation=1.0, contrast_boost=0))
+    engine.bulk_ingest([write_gpx(gpx_dir / "a.gpx", [(LAT, 2.0), (LAT, 2.01)])])
+    assert alpha(engine, mercantile.tile(2.005, LAT, 14)).max() >= 250
+    engine.close()
+
+
 def test_cancel_during_parsing_leaves_store_untouched(engine, gpx_dir):
     from app.jobs import JobManager
     paths = [write_gpx(gpx_dir / f"{i}.gpx", [(LAT, 2.0), (LAT, 2.01)]) for i in range(5)]

@@ -697,7 +697,28 @@ function initMap() {
   if (b) map.fitBounds([[b[1], b[0]], [b[3], b[2]]]);
   else map.setView([46.6, 2.4], 6);
   $$("input[name=map-layer]").forEach((r) => r.addEventListener("change", updatePreviewLayer));
+  map.on("zoomend", updateMapStatus);
   updatePreviewLayer();
+}
+
+// bandeau sur la carte : tuiles en cours de calcul, ou zoom hors de la plage rendue
+function updateMapStatus() {
+  const el = $("#map-status");
+  const layer = state.heatLayer;
+  if (!layer) { el.hidden = true; return; }
+  const { pending, total } = layer.progress;
+  const { minZoom, maxZoom } = layer.options;
+  const z = state.map.getZoom();
+  if (pending > 0) {
+    const what = $("input[name=map-layer]:checked").value === "preview" ? "Calcul de l'aperçu" : "Chargement des tuiles";
+    el.innerHTML = `<span class="spinner"></span>${what}… ${total - pending}/${total}`;
+  } else if (z < minZoom || z > maxZoom) {
+    el.textContent = `Pas de tuiles à ce zoom (${z}) : rendu du zoom ${minZoom} à ${maxZoom}`;
+  } else {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
 }
 
 function updatePreviewLayer() {
@@ -715,7 +736,21 @@ function updatePreviewLayer() {
     url = `/wmts/1.0.0/${encodeURIComponent(layer)}/default/GoogleMapsCompatible/{z}/{y}/{x}.png?t=${Date.now()}`;
     [minZoom, maxZoom] = state.status ? state.status.service.zoom : [0, 18];
   }
-  state.heatLayer = L.tileLayer(url, { minZoom, maxZoom, maxNativeZoom: maxZoom, opacity: 1 }).addTo(map);
+  const layer = L.tileLayer(url, { minZoom, maxZoom, maxNativeZoom: maxZoom, opacity: 1 });
+  // compteur remis à zéro à chaque vague de tuiles (déplacement, zoom) une fois la précédente finie
+  layer.progress = { pending: 0, total: 0 };
+  layer.on("tileloadstart", () => {
+    if (layer.progress.pending === 0) layer.progress.total = 0;
+    layer.progress.pending++;
+    layer.progress.total++;
+    updateMapStatus();
+  });
+  layer.on("tileload tileerror tileabort", () => {
+    layer.progress.pending = Math.max(0, layer.progress.pending - 1);
+    updateMapStatus();
+  });
+  state.heatLayer = layer.addTo(map);
+  updateMapStatus();
 }
 
 // ---------- journal ----------

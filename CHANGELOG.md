@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-11-20
 
 ### Features
 - **One heatmap per year**: besides `heatmap` (all years), every year with activities gets its own WMTS layer (`heatmap-2024`, `heatmap-2025`...), plus `heatmap-current`, a stable address for the current year that moves on by itself on January 1st. All of them are listed in `GetCapabilities`. A new activity only recomputes its own year and the all-years layer.

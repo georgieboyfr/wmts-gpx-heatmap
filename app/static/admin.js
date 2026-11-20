@@ -115,6 +115,7 @@ const state = {
   logs: { after: 0 },
   render: { dirty: false, gradient: [] },
   map: null,
+  layers: { data: null, selected: null, map: null, tiles: null, stamp: Date.now() },
 };
 
 // ---------- connexion ----------
@@ -172,6 +173,7 @@ function selectTab(tab) {
   window.scrollTo(0, 0);
   if (tab === "data") loadFiles();
   if (tab === "render") initMap();
+  if (tab === "layers") loadLayers();
   if (tab === "logs") pollLogs(true);
 }
 $$(".tabs button").forEach((b) => b.addEventListener("click", () => selectTab(b.dataset.tab)));
@@ -206,7 +208,10 @@ function renderStatus() {
 
   // une tâche vient de se terminer : rafraîchir ce qui en dépend
   const signature = jobs.filter((j) => ["done", "failed", "cancelled"].includes(j.status)).map((j) => j.id).join(",");
-  if (state.lastJobsSignature && signature !== state.lastJobsSignature && state.tab === "data") loadFiles();
+  if (state.lastJobsSignature && signature !== state.lastJobsSignature) {
+    if (state.tab === "data") loadFiles();
+    if (state.tab === "layers") loadLayers(true);  // tuiles recalculées : carte rechargée
+  }
   state.lastJobsSignature = signature;
 }
 
@@ -610,11 +615,33 @@ function renderGradientEditor() {
   drawGradientBar();
 }
 
-function drawGradientBar() {
-  const stops = [...state.render.gradient].sort((a, b) => a[0] - b[0])
+function gradientCss(gradient) {
+  const stops = [...gradient].sort((a, b) => a[0] - b[0])
     .map(([f, c]) => `rgba(${c[0]},${c[1]},${c[2]},${(c[3] / 255).toFixed(3)}) ${(f * 100).toFixed(1)}%`);
-  $("#gradient-bar").innerHTML = `<div style="background: linear-gradient(to right, ${stops.join(", ")})"></div>`;
+  return `linear-gradient(to right, ${stops.join(", ")})`;
 }
+
+// pastille cliquable d'un dégradé (modèles de l'onglet Rendu, couches annuelles)
+function swatch(gradient, label, active, attrs = "") {
+  return `<button type="button" class="swatch ${active ? "active" : ""}" title="${esc(label)}" aria-label="${esc(label)}"
+    aria-pressed="${active}" ${attrs}><span class="swatch-bar"><span style="background: ${gradientCss(gradient)}"></span></span></button>`;
+}
+const presetName = (id) => t(`preset.${id}`);
+const sameGradient = (a, b) => JSON.stringify([...a].sort((x, y) => x[0] - y[0])) === JSON.stringify([...b].sort((x, y) => x[0] - y[0]));
+
+function drawGradientBar() {
+  $("#gradient-bar").innerHTML = `<div style="background: ${gradientCss(state.render.gradient)}"></div>`;
+  const presets = (state.settings && state.settings.presets) || {};
+  $("#render-presets").innerHTML = Object.entries(presets)
+    .map(([id, stops]) => swatch(stops, presetName(id), sameGradient(stops, state.render.gradient), `data-preset="${id}"`)).join("");
+}
+$("#render-presets").addEventListener("click", (e) => {
+  const chip = e.target.closest("[data-preset]");
+  if (!chip) return;
+  state.render.gradient = state.settings.presets[chip.dataset.preset].map(([f, c]) => [f, [...c]]);
+  renderGradientEditor();
+  renderChanged();
+});
 
 $("#gradient-stops").addEventListener("input", (e) => {
   const row = e.target.closest(".stop-row");
@@ -746,6 +773,156 @@ function updatePreviewLayer() {
   updateMapStatus();
 }
 
+// ---------- couches (une par année) ----------
+
+function layerName(l) {
+  if (l.kind === "all") return t("layers.all");
+  if (l.kind === "current") return t("layers.current", { year: l.year });
+  return String(l.year);
+}
+
+async function loadLayers(refreshTiles = false) {
+  let data;
+  try { data = await api("/admin/api/layers"); }
+  catch (err) { return toast(err.message, "err"); }
+  state.layers.data = data;
+  if (!data.layers.some((l) => l.id === state.layers.selected)) state.layers.selected = data.layers[0].id;
+  if (refreshTiles) state.layers.stamp = Date.now();
+  renderLayers();
+  initLayersMap();
+  updateLayersMap();
+}
+
+function renderLayers() {
+  const d = state.layers.data;
+  const notices = [];
+  if (d.unread) notices.push(`<div class="notice info">${t("layers.unread", { n: fmtNum(d.unread), count: d.unread })}</div>`);
+  if (d.undated) notices.push(`<div class="notice warn">${t("layers.undated", { n: fmtNum(d.undated), count: d.undated })}</div>`);
+  $("#layers-notice").innerHTML = notices.join("");
+  $("#layers-list").innerHTML = d.layers.map((l) => layerRow(d, l)).join("");
+  renderSyntax();
+}
+
+function layerRow(d, l) {
+  const selected = l.id === state.layers.selected;
+  let colors;
+  if (l.kind === "all") {
+    colors = `<div class="layer-gradient"><span class="swatch-bar wide"><span style="background: ${gradientCss(d.color_gradient)}"></span></span>
+      <button type="button" class="btn ghost small" data-goto="render">${t("layers.edit_in_render")}</button></div>`;
+  } else {
+    const attrs = (preset) => `data-year="${l.year}" data-preset="${preset}"`;
+    const chips = [swatch(d.color_gradient, t("layers.same_as_all"), !l.gradient, attrs(""))]
+      .concat(Object.entries(d.presets).map(([id, stops]) => swatch(stops, presetName(id), l.gradient === id, attrs(id))));
+    colors = `<div class="swatches">${chips.join("")}</div>
+      <div class="muted small">${t("layers.gradient")} <strong>${esc(l.gradient ? presetName(l.gradient) : t("layers.same_as_all"))}</strong></div>`;
+  }
+  const hint = l.kind === "current" ? `<p class="muted small">${t("layers.current_hint", { year: l.year })}</p>` : "";
+  return `<div class="layer-row ${selected ? "selected" : ""}" data-layer="${esc(l.id)}">
+    <div class="layer-head">
+      <label class="layer-pick"><input type="radio" name="layer-pick" value="${esc(l.id)}" ${selected ? "checked" : ""}>
+        <strong>${esc(layerName(l))}</strong></label>
+      <span class="muted small">${t("layers.files", { n: fmtNum(l.files), count: l.files })}</span>
+      <code>${esc(l.id)}</code>
+    </div>${hint}${colors}</div>`;
+}
+
+function selectLayer(id) {
+  if (id === state.layers.selected) return;
+  state.layers.selected = id;
+  renderLayers();
+  updateLayersMap();
+}
+
+$("#layers-list").addEventListener("click", (e) => {
+  const chip = e.target.closest(".swatch[data-year]");
+  if (chip) return setYearGradient(chip.dataset.year, chip.dataset.preset || null);
+  const row = e.target.closest(".layer-row");
+  if (row && !e.target.closest("button, a")) selectLayer(row.dataset.layer);
+});
+
+async function setYearGradient(year, preset) {
+  try {
+    const r = await api("/admin/api/layers/gradients", { method: "PUT", body: { [year]: preset } });
+    state.layers.data = r;
+    renderLayers();
+    const name = preset ? presetName(preset) : t("layers.same_as_all");
+    toast(r.job ? t("layers.gradient_saved", { year, name }) : t("layers.gradient_unchanged", { year, name }), "ok");
+    poll();
+  } catch (err) { toast(err.message, "err"); }
+}
+
+function renderSyntax() {
+  const d = state.layers.data;
+  const l = d.layers.find((x) => x.id === state.layers.selected);
+  const xyz = `${d.base_url}/wmts/1.0.0/${l.id}/default/GoogleMapsCompatible/{z}/{y}/{x}.png`;
+  const caps = `${d.base_url}/wmts?SERVICE=WMTS&REQUEST=GetCapabilities`;
+  const kvp = `${d.base_url}/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=${l.id}&STYLE=default`
+    + `&TILEMATRIXSET=GoogleMapsCompatible&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/png`;
+  const leaflet = `L.tileLayer('${xyz}', {\n  minZoom: ${d.zoom[0]}, maxZoom: ${d.zoom[1]}, opacity: 0.85\n}).addTo(map);`;
+  $("#layer-syntax").innerHTML = `
+    <p class="small">${t("layers.syntax_for", { name: esc(layerName(l)), id: esc(l.id) })}</p>
+    ${snippet(t("layers.syn_xyz"), xyz, t("layers.syn_xyz_hint"))}
+    ${snippet(t("layers.syn_caps"), caps, t("layers.syn_caps_hint", { id: esc(l.id) }))}
+    ${snippet(t("layers.syn_kvp"), kvp)}
+    ${snippet("Leaflet", leaflet)}
+    <p class="muted small">${t("layers.syn_names", { layer: esc(d.layer), year: d.current_year })}</p>`;
+}
+
+function snippet(label, text, hint = "") {
+  return `<div class="snippet"><div class="snippet-head"><strong class="small">${esc(label)}</strong>
+      <button type="button" class="btn ghost small" data-copy="${esc(text)}">${t("layers.copy")}</button></div>
+    <pre><code>${esc(text)}</code></pre>${hint ? `<p class="muted small">${hint}</p>` : ""}</div>`;
+}
+
+// copie : l'API presse-papiers n'existe qu'en HTTPS (ou localhost), repli sinon
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-copy]");
+  if (!btn) return;
+  const text = btn.dataset.copy;
+  let ok = false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); ok = true; }
+  } catch (err) { ok = false; }
+  if (!ok) {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.cssText = "position:fixed;opacity:0";
+    document.body.append(area);
+    area.select();
+    try { ok = document.execCommand("copy"); } catch (err) { ok = false; }
+    area.remove();
+  }
+  toast(ok ? t("layers.copied") : t("layers.copy_failed"), ok ? "ok" : "err");
+});
+
+function initLayersMap() {
+  if (typeof L === "undefined") {
+    $("#layers-map").innerHTML = `<div class="notice warn" style="margin:12px">${t("map.no_leaflet")}</div>`;
+    return;
+  }
+  if (state.layers.map) { setTimeout(() => state.layers.map.invalidateSize(), 50); return; }
+  const map = L.map("layers-map", { minZoom: 2, maxZoom: 18 });
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    maxZoom: 19, className: "basemap-dark",
+  }).addTo(map);
+  const b = state.status && state.status.stats.data_bounds;
+  if (b) map.fitBounds([[b[1], b[0]], [b[3], b[2]]]);
+  else map.setView([46.6, 2.4], 6);
+  state.layers.map = map;
+}
+
+function updateLayersMap() {
+  const map = state.layers.map;
+  const d = state.layers.data;
+  if (!map || !d) return;
+  const l = d.layers.find((x) => x.id === state.layers.selected);
+  $("#layer-map-title").textContent = `${t("map.title")} — ${layerName(l)}`;
+  if (state.layers.tiles) map.removeLayer(state.layers.tiles);
+  const url = `/wmts/1.0.0/${encodeURIComponent(l.id)}/default/GoogleMapsCompatible/{z}/{y}/{x}.png?t=${state.layers.stamp}`;
+  state.layers.tiles = L.tileLayer(url, { minZoom: d.zoom[0], maxZoom: d.zoom[1], maxNativeZoom: d.zoom[1] }).addTo(map);
+}
+
 // ---------- journal ----------
 
 let logsTimer;
@@ -786,5 +963,5 @@ applyTranslations();
 window.selectTab = selectTab;
 const initialTab = location.hash.slice(1);
 checkSession().then(() => {
-  if (["dashboard", "garmin", "data", "render", "logs"].includes(initialTab)) selectTab(initialTab);
+  if (["dashboard", "garmin", "data", "render", "layers", "logs"].includes(initialTab)) selectTab(initialTab);
 }).catch((err) => toast(err.message, "err"));

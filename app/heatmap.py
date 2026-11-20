@@ -31,7 +31,8 @@ import threading
 import time
 from collections import OrderedDict, defaultdict
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 
 import mercantile
@@ -40,6 +41,7 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 
 from . import gpx_utils
+from .gradients import PRESETS
 from .gpx_utils import normalize_path
 from .jobs import NULL_PROGRESS
 
@@ -56,6 +58,12 @@ DEFAULT_SIMPLIFY_M = 1.0  # tolérance de simplification des traces à l'import 
 PARALLEL_MIN_TILES = 256  # en dessous, rendu dans le processus principal (démarrage des processus évité)
 MAX_AUTO_WORKERS = 4
 WORKER_MEMORY_BUDGET = 200 * 2**20  # mémoire libre exigée par processus de rendu en mode automatique
+YEARS_DIR = "years"  # tuiles des couches annuelles : <tiles>/years/<année>/<z>/<x>/<y>.png
+YEAR_CACHE_SIZE = 3  # sous-ensembles de points par année gardés en mémoire
+
+
+def current_year() -> int:
+    return datetime.now().year
 
 
 def _file_signature(path):
@@ -270,15 +278,29 @@ class RenderParams:
 class Points:
     """Points en mémoire, triés par segment puis par ordre de passage (les runs d'un
     même seg_id sont contigus). Jamais modifié en place. lat / lon sont des entiers
-    32 bits en microdegrés et seg un entier 32 bits : 12 octets par point au lieu de 24
-    (la base garde les coordonnées complètes)."""
+    32 bits en microdegrés et seg un entier 32 bits, plus l'année de l'activité sur 16
+    bits (0 = non datée) : 14 octets par point au lieu de 26 (la base garde les
+    coordonnées complètes). Les processus de rendu n'ont pas besoin de l'année (None)."""
     seg: np.ndarray
     lat: np.ndarray
     lon: np.ndarray
+    year: np.ndarray = field(default=None)
 
     @classmethod
     def empty(cls):
-        return cls(*(np.empty((0,), dtype=np.int32) for _ in range(3)))
+        return cls(*(np.empty((0,), dtype=np.int32) for _ in range(3)), np.empty((0,), dtype=np.uint16))
+
+    @classmethod
+    def concat(cls, *parts):
+        return cls(*(np.concatenate([getattr(p, name) for p in parts])
+                     for name in ("seg", "lat", "lon", "year")))
+
+    def subset(self, mask):
+        return Points(self.seg[mask], self.lat[mask], self.lon[mask], self.year[mask])
+
+    def years(self):
+        """Années présentes (hors points non datés), triées."""
+        return [int(y) for y in np.unique(self.year) if y]
 
     def __len__(self):
         return len(self.lat)
@@ -287,6 +309,8 @@ class Points:
 class HeatmapEngine:
     def __init__(self, config: dict):
         self.params = RenderParams.from_config(config["render"], config.get("color_gradient"))
+        self.year_gradients = {}
+        self.set_year_gradients(config.get("year_gradients") or {})
         self.simplify_m = float((config.get("ingest") or {}).get("simplify_tolerance_m", DEFAULT_SIMPLIFY_M))
         self.render_workers = render_workers_from_config((config.get("performance") or {}).get("render_workers", 0))
         self.tiles_dir = Path(config["paths"]["tiles"])
@@ -302,6 +326,8 @@ class HeatmapEngine:
         self._tile_count_cache = (0.0, 0)
         self._preview_lock = threading.Lock()
         self._preview_cache = (None, OrderedDict())  # ((points, marge), {(z, x, y): indices})
+        self._year_lock = threading.Lock()
+        self._year_cache = (None, OrderedDict())  # (points, {année: sous-ensemble de points})
 
     def close(self):
         with self._lock, self._read_lock:
@@ -313,6 +339,44 @@ class HeatmapEngine:
         recalculées : lancer rerender_all() pour les mettre à jour."""
         self.params = RenderParams.from_config(render, gradient)
         return self.params
+
+    def set_year_gradients(self, choices: dict) -> set:
+        """Dégradé (identifiant de gradients.PRESETS) de chaque couche annuelle ; une
+        année absente reprend le dégradé de la couche « toutes années ». Retourne les
+        années dont le choix a changé (leurs tuiles sont à recalculer)."""
+        new = {int(y): p for y, p in choices.items() if p}
+        unknown = [p for p in new.values() if p not in PRESETS]
+        if unknown:
+            raise ValueError(f"Configuration invalide : dégradé inconnu {unknown[0]} (au choix : {', '.join(PRESETS)})")
+        old, self.year_gradients = self.year_gradients, new
+        return {y for y in set(old) | set(new) if old.get(y) != new.get(y)}
+
+    def layer_params(self, year=None) -> RenderParams:
+        """Réglages d'une couche : ceux de la couche « toutes années », avec le dégradé
+        choisi pour l'année s'il y en a un."""
+        params = self.params
+        preset = self.year_gradients.get(year) if year is not None else None
+        if preset is None:
+            return params
+        return replace(params, lut=_make_lut(PRESETS[preset]))
+
+    def layer_dir(self, year=None) -> Path:
+        return self.tiles_dir if year is None else self.tiles_dir / YEARS_DIR / str(int(year))
+
+    def _year_points(self, pts, year) -> Points:
+        """Points des activités d'une année (les derniers demandés restent en cache)."""
+        with self._year_lock:
+            key, cache = self._year_cache
+            if key is not pts:
+                cache = OrderedDict()
+                self._year_cache = (pts, cache)
+            if year in cache:
+                cache.move_to_end(year)
+                return cache[year]
+            sub = cache[year] = pts.subset(pts.year == year)
+            while len(cache) > YEAR_CACHE_SIZE:
+                cache.popitem(last=False)
+            return sub
 
     # raccourcis (tests, compatibilité)
     min_zoom = property(lambda self: self.params.min_zoom)
@@ -361,7 +425,9 @@ class HeatmapEngine:
                 log.info("Base migrée : %d fichier(s) importé(s) par une version précédente. "
                          "Une réindexation permet de gérer aussi leur suppression/modification.",
                          len(legacy))
-        for col, ddl in (("points", "INTEGER"), ("imported_at", "REAL"), ("error", "TEXT")):
+        # year : année de l'activité (0 = fichier non daté, NULL = pas encore lue : fichiers
+        # importés avant les couches annuelles, voir backfill_years)
+        for col, ddl in (("points", "INTEGER"), ("imported_at", "REAL"), ("error", "TEXT"), ("year", "INTEGER")):
             if col not in cols:
                 c.execute(f"ALTER TABLE ingested_files ADD COLUMN {col} {ddl}")
         c.commit()
@@ -383,7 +449,10 @@ class HeatmapEngine:
             lat[i:i + len(arr)] = _to_e6(arr[:, 1])
             lon[i:i + len(arr)] = _to_e6(arr[:, 2])
             i += len(arr)
-        self.pts = Points(seg[:i], lat[:i], lon[:i])
+        seg_years = self.conn.execute(
+            "SELECT s.seg_id, COALESCE(f.year, 0) FROM segments s JOIN ingested_files f ON f.path = s.path"
+        ).fetchall()
+        self.pts = Points(seg[:i], lat[:i], lon[:i], _years_of(seg[:i], seg_years))
         max_seg = self.conn.execute(
             "SELECT MAX(m) FROM (SELECT MAX(seg_id) AS m FROM points UNION ALL SELECT MAX(seg_id) FROM segments)"
         ).fetchone()[0]
@@ -435,34 +504,35 @@ class HeatmapEngine:
             parsed = []
             for path, sig in todo:
                 try:
-                    segments, waypoints = gpx_utils.parse_gpx_segments(path)
+                    segments, waypoints, year = gpx_utils.parse_gpx(path)
                     arrays = [np.array(s, dtype=np.float64) for s in segments + [[wp] for wp in waypoints]]
                     arrays = [a[simplify_track(a, self.simplify_m)] for a in arrays]
                     del segments, waypoints
-                    parsed.append((path, sig, arrays, None))
+                    parsed.append((path, sig, arrays, year, None))
                 except Exception as e:
                     log.exception("GPX illisible/invalide, ignoré : %s", path)
-                    parsed.append((path, sig, None, str(e) or e.__class__.__name__))
+                    parsed.append((path, sig, None, None, str(e) or e.__class__.__name__))
                 progress.advance()
             # rien n'a été modifié jusqu'ici : une annulation pendant la lecture laisse tout intact
 
             changed = [p for p, _ in todo if self._file_row(p) is not None]
             old = self._remove_from_store(changed)
 
-            seg_arrays, seg_rows, file_rows = [], [], []  # seg_arrays : (seg_id, tableau (n, 2))
+            # seg_arrays : (seg_id, année, tableau (n, 2))
+            seg_arrays, seg_rows, file_rows = [], [], []
             now = time.time()
-            for path, sig, segments, error in parsed:
+            for path, sig, segments, year, error in parsed:
                 if segments is None:
                     # mémorisé avec sa signature : ne sera retenté que si le fichier change
                     # (ex : copie encore en cours au moment de la lecture)
-                    file_rows.append((path, *sig, 0, None, now, error[:500]))
+                    file_rows.append((path, *sig, 0, None, now, error[:500], None))
                     continue
                 for pts in segments:
                     sid = self._next_seg_id
                     self._next_seg_id += 1
                     seg_rows.append((sid, path))
-                    seg_arrays.append((sid, pts))
-                file_rows.append((path, *sig, 1, sum(len(s) for s in segments), now, None))
+                    seg_arrays.append((sid, year, pts))
+                file_rows.append((path, *sig, 1, sum(len(s) for s in segments), now, None, year))
             del parsed
 
             failed = sum(1 for r in file_rows if r[3] == 0)
@@ -471,36 +541,30 @@ class HeatmapEngine:
 
             def point_rows():
                 # générées segment par segment : jamais tout le lot en tuples Python à la fois
-                for sid, pts in seg_arrays:
+                for sid, _, pts in seg_arrays:
                     yield from zip(itertools.repeat(sid), range(len(pts)), pts[:, 0].tolist(), pts[:, 1].tolist())
 
             self.conn.executemany("INSERT INTO points(seg_id, seq, lat, lon) VALUES (?,?,?,?)", point_rows())
             self.conn.executemany("INSERT INTO segments(seg_id, path) VALUES (?,?)", seg_rows)
             self.conn.executemany(
-                "INSERT OR REPLACE INTO ingested_files(path, mtime, size, ok, points, imported_at, error) "
-                "VALUES (?,?,?,?,?,?,?)", file_rows
+                "INSERT OR REPLACE INTO ingested_files(path, mtime, size, ok, points, imported_at, error, year) "
+                "VALUES (?,?,?,?,?,?,?,?)", file_rows
             )
             self.conn.commit()
 
             if seg_arrays:
-                new = Points(np.concatenate([np.full(len(pts), sid, dtype=np.int32) for sid, pts in seg_arrays]),
-                             _to_e6(np.concatenate([pts[:, 0] for _, pts in seg_arrays])),
-                             _to_e6(np.concatenate([pts[:, 1] for _, pts in seg_arrays])))
+                new = Points(np.concatenate([np.full(len(pts), sid, dtype=np.int32) for sid, _, pts in seg_arrays]),
+                             _to_e6(np.concatenate([pts[:, 0] for _, _, pts in seg_arrays])),
+                             _to_e6(np.concatenate([pts[:, 1] for _, _, pts in seg_arrays])),
+                             np.concatenate([np.full(len(pts), y, dtype=np.uint16) for _, y, pts in seg_arrays]))
                 del seg_arrays
-                self.pts = Points(np.concatenate([self.pts.seg, new.seg]),
-                                  np.concatenate([self.pts.lat, new.lat]),
-                                  np.concatenate([self.pts.lon, new.lon]))
+                self.pts = Points.concat(self.pts, new)
             else:
                 new = Points.empty()
 
             if render:
                 # une seule passe de rendu pour les anciens points retirés ET les nouveaux
-                self._rerender_affected(
-                    np.concatenate([old.lat, new.lat]),
-                    np.concatenate([old.lon, new.lon]),
-                    np.concatenate([old.seg, new.seg]),
-                    progress,
-                )
+                self._rerender_affected(Points.concat(old, new), progress)
             return len(todo)
 
     def remove_files(self, paths, progress=NULL_PROGRESS) -> int:
@@ -511,7 +575,7 @@ class HeatmapEngine:
                 return 0
             removed = self._remove_from_store(paths)
             self.conn.commit()
-            self._rerender_affected(removed.lat, removed.lon, removed.seg, progress)
+            self._rerender_affected(removed, progress)
             return len(paths)
 
     def _remove_from_store(self, paths) -> Points:
@@ -533,9 +597,8 @@ class HeatmapEngine:
             return Points.empty()
         pts = self.pts
         mask = np.isin(pts.seg, np.array(seg_ids, dtype=pts.seg.dtype))
-        keep = ~mask
-        self.pts = Points(pts.seg[keep], pts.lat[keep], pts.lon[keep])
-        return Points(pts.seg[mask], pts.lat[mask], pts.lon[mask])
+        self.pts = pts.subset(~mask)
+        return pts.subset(mask)
 
     def sync_folder(self, folder, progress=NULL_PROGRESS) -> dict:
         """Aligne la base sur le contenu du dossier : importe en un seul lot les .gpx
@@ -571,28 +634,74 @@ class HeatmapEngine:
             self.rerender_all(progress)
         return {"imported": imported}
 
+    def needs_year_backfill(self) -> bool:
+        return self._read("SELECT COUNT(*) FROM ingested_files WHERE ok = 1 AND year IS NULL")[0][0] > 0
+
+    def backfill_years(self, progress=NULL_PROGRESS) -> int:
+        """Lit l'année des activités importées avant l'arrivée des couches annuelles, puis
+        calcule leurs tuiles annuelles (la couche « toutes années » ne change pas). Rien
+        n'est modifié si la tâche est annulée pendant la lecture. Retourne le nombre de
+        fichiers lus."""
+        with self._lock:
+            paths = [r[0] for r in self.conn.execute(
+                "SELECT path FROM ingested_files WHERE ok = 1 AND year IS NULL")]
+            if not paths:
+                return 0
+            progress.phase("Lecture des dates des activités", len(paths))
+            years = []
+            for path in paths:
+                try:
+                    years.append((gpx_utils.read_year(path), path))
+                except Exception:  # fichier disparu ou devenu illisible : rangé comme non daté
+                    years.append((0, path))
+                progress.advance()
+            self.conn.executemany("UPDATE ingested_files SET year = ? WHERE path = ?", years)
+            self.conn.commit()
+
+            pts = self.pts
+            seg_years = self.conn.execute(
+                "SELECT s.seg_id, COALESCE(f.year, 0) FROM segments s JOIN ingested_files f ON f.path = s.path"
+            ).fetchall()
+            year = _years_of(pts.seg, seg_years)
+            changed = year != pts.year
+            self.pts = Points(pts.seg, pts.lat, pts.lon, year)
+            dated = sum(1 for y, _ in years if y)
+            log.info("Dates lues pour %d fichier(s) (%d daté(s)) : calcul des couches annuelles", len(years), dated)
+            self._rerender_affected(self.pts.subset(changed), progress, include_global=False)
+            self._tile_count_cache = (0.0, 0)
+            return len(years)
+
     # ---------- rendu ----------
 
-    def rerender_all(self, progress=NULL_PROGRESS):
-        """Recalcule toutes les tuiles (après un changement de style/config). Les tuiles
-        existantes restent servies pendant le calcul (remplacement atomique) ; celles qui
-        n'ont plus lieu d'être (zone vide, zoom hors plage) sont supprimées à la fin."""
+    def rerender_all(self, progress=NULL_PROGRESS, years=None, include_global=True):
+        """Recalcule toutes les tuiles (après un changement de style/config) : celles de la
+        couche « toutes années » et de chaque couche annuelle, ou seulement des années
+        `years` (nouveau dégradé pour une année). Les tuiles existantes restent servies
+        pendant le calcul (remplacement atomique) ; celles qui n'ont plus lieu d'être (zone
+        vide, zoom hors plage, année sans activité) sont supprimées à la fin."""
         with self._lock:
             pts = self.pts
-            written = self._rerender_affected(pts.lat, pts.lon, pts.seg, progress)
+            present = pts.years()
+            targets = present if years is None else [y for y in years if y in present]
+            jobs = [(None, pts, pts)] if include_global else []
+            for y in targets:
+                sub = self._year_points(pts, y)
+                jobs.append((y, sub, sub))
+            written = self._render_layers(jobs, progress)
+
             progress.phase("Nettoyage des tuiles obsolètes")
-            for f in list(self.tiles_dir.rglob("*")):
-                if not f.is_file():
-                    continue
-                try:
-                    key = (int(f.parent.parent.name), int(f.parent.name), int(f.name.split(".")[0]))
-                except ValueError:
-                    key = None
-                if f.suffix != ".png" or key not in written:
-                    f.unlink(missing_ok=True)
-            for d in sorted((d for d in self.tiles_dir.rglob("*") if d.is_dir()), reverse=True):
-                if not any(d.iterdir()):
-                    d.rmdir()
+            if include_global:
+                _clean_layer(self.tiles_dir, written.get(None, set()), skip=YEARS_DIR)
+            for y in targets:
+                _clean_layer(self.layer_dir(y), written.get(y, set()))
+            # années qui n'ont plus d'activité : toute leur couche disparaît
+            years_dir = self.tiles_dir / YEARS_DIR
+            on_disk = [int(d.name) for d in years_dir.iterdir() if d.name.isdigit()] if years_dir.is_dir() else []
+            for y in on_disk:
+                if y not in present and (years is None or y in years):
+                    shutil.rmtree(self.layer_dir(y), ignore_errors=True)
+            if years_dir.is_dir() and not any(years_dir.iterdir()):
+                years_dir.rmdir()
             self._tile_count_cache = (0.0, 0)
 
     @staticmethod
@@ -607,25 +716,45 @@ class HeatmapEngine:
         buf = cls._buffer_deg(params, z)
         return b.west - buf, b.south - buf, b.east + buf, b.north + buf
 
-    def _rerender_affected(self, lat_new, lon_new, seg_new, progress=NULL_PROGRESS):
-        """Calcule l'ensemble des tuiles à (re)générer comme l'UNION des empreintes de
-        chaque trace individuelle (pas la bbox globale du lot). Important pour un import
-        groupé de traces géographiquement dispersées (ex: plusieurs pays) : une bbox
-        globale engloberait d'immenses zones vides et ferait exploser le nombre de
-        tuiles à haut zoom. Retourne l'ensemble des tuiles écrites (non vides)."""
-        if len(seg_new) == 0:
-            return set()
-        params = self.params
+    def _rerender_affected(self, affected: Points, progress=NULL_PROGRESS, include_global=True):
+        """(Re)calcule les tuiles touchées par les points `affected` (ajoutés ou retirés) :
+        dans la couche « toutes années » et dans la couche de leur année. Une activité ne
+        recalcule donc que sa propre année, en plus de la couche globale. Retourne les
+        tuiles écrites (non vides) par couche : {None ou année: {(z, x, y)}}."""
+        pts = self.pts
+        jobs = [(None, pts, affected)] if include_global else []
+        for y in affected.years():
+            jobs.append((y, self._year_points(pts, y), affected.subset(affected.year == y)))
+        return self._render_layers(jobs, progress)
 
+    def _render_layers(self, jobs, progress=NULL_PROGRESS):
+        """jobs : (année ou None, points de la couche, points dont les tuiles sont à refaire)."""
+        jobs = [j for j in jobs if len(j[2])]
+        if not jobs:
+            return {}
+        params = self.params
+        progress.phase("Recherche des tuiles", len(jobs) * (params.max_zoom - params.min_zoom + 1))
+        plan = []
+        for year, pts, affected in jobs:
+            layer_params = self.layer_params(year)
+            plan.append((year, pts, layer_params, self._find_tiles(layer_params, affected, progress)))
+        progress.phase("Calcul des tuiles", sum(len(tiles) for *_, tiles in plan))
+        return {year: self._render_tiles(tiles, layer_params, pts, self.layer_dir(year), progress)
+                for year, pts, layer_params, tiles in plan}
+
+    def _find_tiles(self, params, affected, progress=NULL_PROGRESS):
+        """Tuiles à (re)générer : l'UNION des empreintes de chaque trace individuelle (pas
+        la bbox globale du lot). Important pour un import groupé de traces
+        géographiquement dispersées (ex: plusieurs pays) : une bbox globale engloberait
+        d'immenses zones vides et ferait exploser le nombre de tuiles à haut zoom."""
         # les tableaux sont dans l'ordre d'insertion (par seg_id croissant) -> les runs
         # d'un même seg_id sont contigus, pas besoin de trier
-        starts = np.concatenate([[0], np.flatnonzero(np.diff(seg_new)) + 1])
+        starts = np.concatenate([[0], np.flatnonzero(np.diff(affected.seg)) + 1])
         bboxes = list(zip(*(
             (reduce.reduceat(coord, starts) / COORD_SCALE).tolist()
-            for reduce, coord in ((np.minimum, lon_new), (np.minimum, lat_new), (np.maximum, lon_new), (np.maximum, lat_new))
+            for reduce, coord in ((np.minimum, affected.lon), (np.minimum, affected.lat),
+                                  (np.maximum, affected.lon), (np.maximum, affected.lat))
         )))
-
-        progress.phase("Recherche des tuiles", params.max_zoom - params.min_zoom + 1)
         tiles = set()
         for z in range(params.min_zoom, params.max_zoom + 1):
             buf = self._buffer_deg(params, z)
@@ -635,21 +764,17 @@ class HeatmapEngine:
                 for tile in mercantile.tiles(w, s, e, n, [z]):
                     tiles.add((z, tile.x, tile.y))
             progress.advance()
-        return self._render_tiles(tiles, params, progress)
+        return tiles
 
-    def _render_tiles(self, tiles, params, progress=NULL_PROGRESS):
-        """Rend les tuiles zoom par zoom, du plus petit au plus grand. Les points retenus
-        pour une tuile sont filtrés parmi ceux de sa tuile mère au zoom précédent (la zone
-        d'une tuile fille est incluse dans celle de sa mère) : le coût d'une tuile dépend
-        des points de sa zone, et non de tous ceux de la région, ce qui évite qu'une zone
-        très fréquentée ralentisse fortement le calcul aux grands zooms."""
-        progress.phase("Calcul des tuiles", len(tiles))
+    def _render_tiles(self, tiles, params, pts, tiles_dir, progress=NULL_PROGRESS):
+        """Rend les tuiles d'une couche, dans le processus principal pour un petit lot,
+        sinon sur plusieurs processus."""
         workers = self.render_workers
         if workers <= 1 or len(tiles) < PARALLEL_MIN_TILES:
-            return _render_tile_group(self.pts, params, self.tiles_dir, tiles, progress.advance)
-        return self._render_tiles_parallel(tiles, params, workers, progress)
+            return _render_tile_group(pts, params, tiles_dir, tiles, progress.advance)
+        return self._render_tiles_parallel(tiles, params, pts, tiles_dir, workers, progress)
 
-    def _render_tiles_parallel(self, tiles, params, workers, progress):
+    def _render_tiles_parallel(self, tiles, params, pts, tiles_dir, workers, progress):
         """Répartit le rendu sur plusieurs processus (Python n'exécute qu'un thread à la fois :
         des threads n'apportent rien ici). Chaque tâche est une tuile « racine » et toutes ses
         descendantes à rendre, pour garder le filtrage des points par tuile mère. Les points
@@ -665,18 +790,18 @@ class HeatmapEngine:
             if t[0] >= split:
                 groups[_ancestor(t, split)].append(t)
 
-        written = _render_tile_group(self.pts, params, self.tiles_dir, head, progress.advance)
+        written = _render_tile_group(pts, params, tiles_dir, head, progress.advance)
         tmp = tempfile.mkdtemp(prefix="render-", dir=self.db_path.parent)
         try:
             for name in ("seg", "lat", "lon"):
-                np.save(os.path.join(tmp, f"{name}.npy"), getattr(self.pts, name))
+                np.save(os.path.join(tmp, f"{name}.npy"), getattr(pts, name))
             # forkserver plutôt que fork : le serveur a déjà des threads (watcher, tâches...)
             methods = multiprocessing.get_all_start_methods()
             ctx = multiprocessing.get_context("forkserver" if "forkserver" in methods else "spawn")
             pool = ProcessPoolExecutor(max_workers=min(workers, len(groups)), mp_context=ctx,
                                        initializer=_worker_init, initargs=(tmp,))
             try:
-                pending = {pool.submit(_worker_render, params, str(self.tiles_dir), group): len(group)
+                pending = {pool.submit(_worker_render, params, str(tiles_dir), group): len(group)
                            for group in groups.values()}
                 while pending:
                     done, _ = wait(pending, return_when=FIRST_COMPLETED)
@@ -812,11 +937,11 @@ class HeatmapEngine:
                 cache.popitem(last=False)
             return idx
 
-    def tile_path(self, z, x, y) -> Path:
-        return _tile_path(self.tiles_dir, z, x, y)
+    def tile_path(self, z, x, y, year=None) -> Path:
+        return _tile_path(self.layer_dir(year), z, x, y)
 
-    def get_tile_path(self, z, x, y):
-        p = self.tile_path(z, x, y)
+    def get_tile_path(self, z, x, y, year=None):
+        p = self.tile_path(z, x, y, year)
         return p if p.exists() else None
 
     @staticmethod
@@ -907,11 +1032,49 @@ class HeatmapEngine:
     def failed_files(self):
         return [r[0] for r in self._read("SELECT path FROM ingested_files WHERE ok = 0")]
 
+    def year_stats(self) -> dict:
+        """{année: nombre d'activités importées} ; 0 = non datées, None = pas encore lues."""
+        return dict(self._read("SELECT year, COUNT(*) FROM ingested_files WHERE ok = 1 GROUP BY year"))
+
 
 # ---------- rendu d'un groupe de tuiles (processus principal ou processus de rendu) ----------
 
 def _tile_path(tiles_dir, z, x, y) -> Path:
     return Path(tiles_dir) / str(z) / str(x) / f"{y}.png"
+
+
+def _years_of(seg, seg_years):
+    """Année de chaque point, d'après les couples (seg_id, année) ; 0 pour un segment
+    inconnu (fichier importé par une très ancienne version)."""
+    if not len(seg_years) or not len(seg):
+        return np.zeros(len(seg), dtype=np.uint16)
+    pairs = np.array(seg_years, dtype=np.int64)
+    pairs = pairs[np.argsort(pairs[:, 0])]
+    ids, years = pairs[:, 0], np.clip(pairs[:, 1], 0, 65535)
+    pos = np.minimum(np.searchsorted(ids, seg), len(ids) - 1)
+    return np.where(ids[pos] == seg, years[pos], 0).astype(np.uint16)
+
+
+def _clean_layer(layer_dir, written, skip=None):
+    """Supprime les tuiles d'une couche qui n'ont pas été écrites par le dernier recalcul
+    complet, puis les dossiers vides. `skip` : sous-dossier à ne pas toucher (les couches
+    annuelles, rangées dans le dossier de la couche globale)."""
+    layer_dir = Path(layer_dir)
+    if not layer_dir.is_dir():
+        return
+    entries = [p for p in layer_dir.rglob("*") if not (skip and p.relative_to(layer_dir).parts[0] == skip)]
+    for f in entries:
+        if not f.is_file():
+            continue
+        try:
+            key = (int(f.parent.parent.name), int(f.parent.name), int(f.name.split(".")[0]))
+        except ValueError:
+            key = None
+        if f.suffix != ".png" or key not in written:
+            f.unlink(missing_ok=True)
+    for d in sorted((d for d in entries if d.is_dir()), reverse=True):
+        if not any(d.iterdir()):
+            d.rmdir()
 
 
 def _ancestor(tile, z):

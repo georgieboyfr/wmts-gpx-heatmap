@@ -6,6 +6,7 @@ Built to run on modest hardware (a home NAS such as Synology, a Raspberry Pi...)
 
 ## Features
 
+- **One heatmap per year**: besides the all-years heatmap, one layer per year of history and one for the current year (`heatmap-current`, which follows the calendar on its own). Each year gets its color gradient in one click among ready-made presets.
 - **Heatmap rendering** by accumulating tracks (each track is drawn as a line, not a point cloud), with a gaussian "glow" blur and a fully customizable color gradient.
 - **Automatic folder watching**: drop a `.gpx` file, it's on the map within seconds. Deleting or replacing a file removes or updates its track too.
 - **Optimized batch import**: files are always ingested in batches (at startup, and when many files land at once while running) — each affected tile is rendered once per batch, not once per file.
@@ -83,7 +84,8 @@ Open **`http://<nas>:8088/admin`** and sign in with the `ADMIN_TOKEN` from `.env
 - **Dashboard** — files, points, tiles, Garmin status; one-click *Rescan folder*, *Recompute tiles*, *Sync Garmin*, *Reindex everything*. Every long operation runs as a background **task** with live progress per phase (files read, tiles computed, ETA), a **Cancel** button and a history.
 - **Garmin** — connect your account (email + password, then the **MFA code** if Garmin asks for one), see its status, last/next sync, sync now, disconnect. When connecting you choose whether the password is **remembered** (stored on the server, so the session can be renewed on its own) or **not** (recommended: only the session token is kept; reconnect from the admin if it ever expires). Auto-sync on/off, interval, history depth and batch size are editable live.
 - **Data** — drag & drop `.gpx` files to upload them; searchable list of imported files with their status, errors on unreadable files, and *Retry*.
-- **Render** — line width, blur, saturation, contrast, zoom range and color gradient, with a **live preview map** computed on the fly from the form; *Apply* saves and recomputes every tile.
+- **Render** — line width, blur, saturation, contrast, zoom range and color gradient (start from a preset in one click, then fine-tune it), with a **live preview map** computed on the fly from the form; *Apply* saves and recomputes every tile.
+- **Layers** — every published layer (all years, current year, one per year) with its number of activities, a map of its tiles, and its **URL syntax** ready to copy (tile URL, GetCapabilities, GetTile, Leaflet snippet). Click a gradient swatch to color a year: only that year is recomputed.
 - **Logs** — the application log, live, filterable by level.
 
 Settings changed in the admin are stored as overrides in `settings.json` next to the database (`/data/db`), on top of `config.yaml`; *Back to config.yaml* removes them. The map basemap of the Render tab is loaded from OpenStreetMap (internet access needed for it only).
@@ -95,6 +97,8 @@ Settings changed in the admin are stored as overrides in `settings.json` next to
 | `/wmts?SERVICE=WMTS&REQUEST=GetCapabilities` | GET | WMTS capabilities (feed this to QGIS, OpenLayers, etc.) |
 | `/wmts?SERVICE=WMTS&REQUEST=GetTile&LAYER=heatmap&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}` | GET | PNG tile, KVP encoding |
 | `/wmts/1.0.0/heatmap/default/GoogleMapsCompatible/{z}/{y}/{x}.png` | GET | PNG tile, RESTful encoding (works as a plain tile source in Leaflet/MapLibre) |
+| `/wmts/1.0.0/heatmap-current/default/GoogleMapsCompatible/{z}/{y}/{x}.png` | GET | Same, current year only (see *Layers per year* below) |
+| `/wmts/1.0.0/heatmap-2024/default/GoogleMapsCompatible/{z}/{y}/{x}.png` | GET | Same, a given year only |
 | `/health` | GET | Confirms the service is up, returns the number of points currently in memory |
 | `/admin` | GET | Administration interface (see above) |
 
@@ -104,6 +108,29 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" http://<nas>:8088/admin/api
 ```
 
 Replace `<nas>` / the hostname and port with your own deployment in every example below.
+
+### Layers per year
+
+Three kinds of layers are published, all listed in `GetCapabilities` (`heatmap` is `server.layer_name`):
+
+| Layer | Content |
+|---|---|
+| `heatmap` | every activity, all years |
+| `heatmap-current` | the current year; moves on to the next year by itself on January 1st, so a map using it never needs updating |
+| `heatmap-2025`, `heatmap-2024`… | one layer per year of history (only years with at least one activity) |
+
+```
+http://<nas>:8088/wmts/1.0.0/heatmap-current/default/GoogleMapsCompatible/{z}/{y}/{x}.png
+http://<nas>:8088/wmts/1.0.0/heatmap-2024/default/GoogleMapsCompatible/{z}/{y}/{x}.png
+http://<nas>:8088/wmts?SERVICE=WMTS&REQUEST=GetTile&LAYER=heatmap-2024&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}
+```
+
+The admin's **Layers** tab shows these URLs for each layer, ready to copy.
+
+- An activity's year is the date of its first GPS point (or the file's date when points have no time). GPX files without any date only appear in `heatmap`.
+- A new activity only recomputes its own year and the all-years layer: year layers cost about as much disk and CPU again as the all-years one, not one full rendering per year.
+- **Colors per year**: in the **Layers** tab, click one of the presets (Ice, Fire, Orange, Green, Violet, Viridis, White for a dark basemap, Graphite for a light one) or *Same as "All years"*. Line width, blur and saturation are shared by every layer. Choices can also be set in `config.yaml` (`year_gradients`, see below).
+- When upgrading from 1.0.8 or earlier, the year of activities already imported is read once at startup (*Reading activity dates* task); no reindex needed.
 
 ### Connecting from your client
 
@@ -174,6 +201,10 @@ color_gradient:                # [position 0-1, [R, G, B, Alpha]] - fully free g
   - [0.65, [80, 190, 255, 225]]
   - [0.85, [190, 235, 255, 245]]
   - [1.00, [255, 255, 255, 255]]
+
+year_gradients:               # gradient of each year layer, among the presets: ice, fire, orange, green,
+  2024: fire                   # violet, viridis, white, graphite. A year not listed uses color_gradient.
+  2025: green                  # Usually chosen from the admin's Layers tab instead.
 
 server:
   base_url: "http://your-nas:8088"   # public URL used inside GetCapabilities

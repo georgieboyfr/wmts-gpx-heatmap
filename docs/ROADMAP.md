@@ -46,11 +46,11 @@ Keep the point arrays in `.npy` files opened with `mmap_mode`, so the OS can pag
 
 ## Features
 
-### Filter by year and by activity type
-A track only belongs to its year layer and to the "all years" layer, so this costs ~2x the CPU and disk of today, not one full rendering per year. A new activity only re-renders its own year and the global layer.
-- Requires storing each activity's date (from the GPX timestamps; a reindex backfills existing tracks) and type (Garmin provides it).
-- Exposed as extra WMTS layers (`heatmap-2024`, `heatmap-run`…), which QGIS and other clients show as regular layers.
-- Alternative: on-demand rendering with a cache, which allows free date ranges without extra storage but slower first display.
+### Filter by activity type
+Year layers now exist (`heatmap-2024`, `heatmap-current`); activity types could follow the same model (`heatmap-run`, `heatmap-ride`…).
+- Requires storing each activity's type (Garmin provides it; GPX `<type>` otherwise).
+- Combining year and type would multiply the layers: better rendered on demand with a cache, which also allows free date ranges.
+- A per-layer render setting (line width, saturation) could follow: today only the gradient differs between layers.
 
 ### Privacy zones
 Hide points within a radius of chosen places (home, work) before rendering — important as soon as the map is shared.

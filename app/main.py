@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import __version__, garmin_account, garmin_sync, heatmap, watcher
+from . import __version__, garmin_account, garmin_sync, gradients, heatmap, watcher
 from .gpx_utils import is_gpx, normalize_path
 from .jobs import JobCancelled, JobManager, LogBuffer
 from .settings import Settings, load_config
@@ -48,6 +48,7 @@ STARTED_AT = time.time()
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 SESSION_COOKIE = "wmts_admin"
 SESSION_MAX_AGE = 30 * 24 * 3600
+CURRENT = "current"  # suffixe de la couche de l'année en cours : <layer>-current
 
 settings = Settings(CONFIG, CONFIG["paths"].get("settings") or DATA_DIR / "settings.json")
 
@@ -100,6 +101,21 @@ def submit_rerender(label="Recalcul de toutes les tuiles"):
         engine.rerender_all(progress=job)
         return {"tuiles": engine.tile_count(max_age=0)}
     return jobs.submit("rerender", label, run, unique=True)
+
+
+def submit_year_rerender(years):
+    years = sorted(years)
+
+    def run(job):
+        engine.rerender_all(progress=job, years=years, include_global=False)
+        return {"tuiles": engine.tile_count(max_age=0)}
+    return jobs.submit("rerender-years", f"Recalcul des tuiles {', '.join(map(str, years))}", run)
+
+
+def submit_year_backfill():
+    def run(job):
+        return {"fichiers lus": engine.backfill_years(progress=job)}
+    return jobs.submit("years", "Lecture des dates des activités", run, unique=True)
 
 
 def submit_retry(paths):
@@ -196,6 +212,9 @@ async def lifespan(app):
     observer = watcher.start_watcher(_on_watch_ready, WATCH_DIR, ignore=garmin.is_claimed)
     log.info("Watcher démarré sur %s", WATCH_DIR)
     submit_rescan("Import initial")
+    if engine.needs_year_backfill():
+        # base créée avant les couches annuelles : l'année de chaque activité est lue une fois
+        submit_year_backfill()
     threading.Thread(target=_garmin_loop, daemon=True, name="garmin-loop").start()
     if not ADMIN_TOKEN:
         log.warning("ADMIN_TOKEN non défini : l'administration (/admin) est désactivée.")
@@ -221,10 +240,56 @@ app.add_middleware(
 
 # ---------- WMTS ----------
 
+def layer_year(name):
+    """Année servie par une couche : None pour la couche « toutes années » (<layer>),
+    l'année pour <layer>-2024, l'année en cours pour <layer>-current. Un autre nom sert la
+    couche globale (compatibilité avec les clients qui ignorent le nom de couche)."""
+    if name and name.startswith(LAYER + "-"):
+        suffix = name[len(LAYER) + 1:]
+        if suffix == CURRENT:
+            return heatmap.current_year()
+        if len(suffix) == 4 and suffix.isdigit():
+            return int(suffix)
+    return None
+
+
+def layers():
+    """Couches publiées : (identifiant, titre, année ou None), la globale d'abord, puis
+    celle de l'année en cours et une par année d'historique (la plus récente d'abord)."""
+    year = heatmap.current_year()
+    out = [(LAYER, TITLE, None), (f"{LAYER}-{CURRENT}", f"{TITLE} — année en cours ({year})", year)]
+    out += [(f"{LAYER}-{y}", f"{TITLE} — {y}", y) for y in sorted(engine.pts.years(), reverse=True)]
+    return out
+
+
+def _layer_xml(ident, title, base_url):
+    ident = escape(ident, {'"': "&quot;"})
+    return f"""
+    <Layer>
+      <ows:Title>{escape(title)}</ows:Title>
+      <ows:WGS84BoundingBox>
+        <ows:LowerCorner>-180 -85.051129</ows:LowerCorner>
+        <ows:UpperCorner>180 85.051129</ows:UpperCorner>
+      </ows:WGS84BoundingBox>
+      <ows:Identifier>{ident}</ows:Identifier>
+      <ows:BoundingBox crs="urn:ogc:def:crs:EPSG::3857">
+        <ows:LowerCorner>-20037508.342789 -20037508.342789</ows:LowerCorner>
+        <ows:UpperCorner>20037508.342789 20037508.342789</ows:UpperCorner>
+      </ows:BoundingBox>
+      <Style isDefault="true">
+        <ows:Identifier>default</ows:Identifier>
+      </Style>
+      <Format>image/png</Format>
+      <TileMatrixSetLink>
+        <TileMatrixSet>GoogleMapsCompatible</TileMatrixSet>
+      </TileMatrixSetLink>
+      <ResourceURL format="image/png" resourceType="tile"
+        template="{base_url}/wmts/1.0.0/{ident}/default/GoogleMapsCompatible/{{TileMatrix}}/{{TileRow}}/{{TileCol}}.png"/>
+    </Layer>"""
+
+
 def build_capabilities() -> str:
     params = engine.params
-    title = escape(TITLE)
-    layer = escape(LAYER, {'"': "&quot;"})
     base_url = escape(BASE_URL, {'"': "&quot;"})
     origin_x, origin_y = -20037508.342789244, 20037508.342789244
     matrices = []
@@ -242,6 +307,7 @@ def build_capabilities() -> str:
         <MatrixHeight>{matrix_wh}</MatrixHeight>
       </TileMatrix>""")
     matrices_xml = "".join(matrices)
+    layers_xml = "".join(_layer_xml(ident, title, base_url) for ident, title, _ in layers())
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Capabilities xmlns="http://www.opengis.net/wmts/1.0"
@@ -250,32 +316,11 @@ def build_capabilities() -> str:
               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
               version="1.0.0">
   <ows:ServiceIdentification>
-    <ows:Title>{title}</ows:Title>
+    <ows:Title>{escape(TITLE)}</ows:Title>
     <ows:ServiceType>OGC WMTS</ows:ServiceType>
     <ows:ServiceTypeVersion>1.0.0</ows:ServiceTypeVersion>
   </ows:ServiceIdentification>
-  <Contents>
-    <Layer>
-      <ows:Title>{title}</ows:Title>
-      <ows:WGS84BoundingBox>
-        <ows:LowerCorner>-180 -85.051129</ows:LowerCorner>
-        <ows:UpperCorner>180 85.051129</ows:UpperCorner>
-      </ows:WGS84BoundingBox>
-      <ows:Identifier>{layer}</ows:Identifier>
-      <ows:BoundingBox crs="urn:ogc:def:crs:EPSG::3857">
-        <ows:LowerCorner>-20037508.342789 -20037508.342789</ows:LowerCorner>
-        <ows:UpperCorner>20037508.342789 20037508.342789</ows:UpperCorner>
-      </ows:BoundingBox>
-      <Style isDefault="true">
-        <ows:Identifier>default</ows:Identifier>
-      </Style>
-      <Format>image/png</Format>
-      <TileMatrixSetLink>
-        <TileMatrixSet>GoogleMapsCompatible</TileMatrixSet>
-      </TileMatrixSetLink>
-      <ResourceURL format="image/png" resourceType="tile"
-        template="{base_url}/wmts/1.0.0/{layer}/default/GoogleMapsCompatible/{{TileMatrix}}/{{TileRow}}/{{TileCol}}.png"/>
-    </Layer>
+  <Contents>{layers_xml}
     <TileMatrixSet>
       <ows:Identifier>GoogleMapsCompatible</ows:Identifier>
       <ows:SupportedCRS>urn:ogc:def:crs:EPSG::3857</ows:SupportedCRS>{matrices_xml}
@@ -303,9 +348,9 @@ def transparent_png() -> bytes:
 TILE_HEADERS = {"Cache-Control": "no-cache"}
 
 
-def serve_tile(z: int, x: int, y: int, request: Request) -> Response:
+def serve_tile(z: int, x: int, y: int, request: Request, year=None) -> Response:
     try:
-        with open(engine.tile_path(z, x, y), "rb") as f:
+        with open(engine.tile_path(z, x, y, year), "rb") as f:
             content = f.read()
             st = os.fstat(f.fileno())
         etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
@@ -333,13 +378,13 @@ def wmts_kvp(request: Request):
             x = int(params["TILECOL"])
         except (KeyError, ValueError):
             return Response(status_code=400, content="Paramètres TILEMATRIX / TILEROW / TILECOL manquants ou invalides")
-        return serve_tile(z, x, y, request)
+        return serve_tile(z, x, y, request, layer_year(params.get("LAYER")))
     return Response(status_code=400, content="REQUEST non supportée (GetCapabilities / GetTile)")
 
 
 @app.get("/wmts/1.0.0/{layer}/default/GoogleMapsCompatible/{z}/{y}/{x}.png")
 def wmts_restful(layer: str, z: int, y: int, x: int, request: Request):
-    return serve_tile(z, x, y, request)
+    return serve_tile(z, x, y, request, layer_year(layer))
 
 
 @app.get("/health")
@@ -531,6 +576,7 @@ def api_settings():
         "overrides": settings.overrides(),
         "defaults": {"render": CONFIG["render"], "color_gradient": CONFIG["color_gradient"],
                      "garmin": CONFIG.get("garmin") or {}},
+        "presets": gradients.PRESETS,
     }
 
 
@@ -587,6 +633,45 @@ def api_preview(z: int, x: int, y: int, s: str):
         raise HTTPException(400, str(e))
     content = engine.render_preview(z, x, y, params) or transparent_png()
     return Response(content=content, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@admin.get("/api/layers")
+def api_layers():
+    """Couches publiées, avec le dégradé de chaque année et de quoi écrire leurs URL."""
+    counts = engine.year_stats()
+    choices = engine.year_gradients
+    out = []
+    for ident, title, year in layers():
+        kind = "all" if year is None else CURRENT if ident.endswith(f"-{CURRENT}") else "year"
+        out.append({"id": ident, "title": title, "year": year, "kind": kind,
+                    "files": sum(counts.values()) if year is None else counts.get(year, 0),
+                    "gradient": choices.get(year) if year is not None else None})
+    return {
+        "base_url": BASE_URL,
+        "layer": LAYER,
+        "current_year": heatmap.current_year(),
+        "presets": gradients.PRESETS,
+        "color_gradient": settings.effective()["color_gradient"],
+        "zoom": [engine.params.min_zoom, engine.params.max_zoom],
+        "undated": counts.get(0, 0),
+        "unread": counts.get(None, 0),
+        "layers": out,
+    }
+
+
+@admin.put("/api/layers/gradients")
+def api_set_year_gradients(values: dict = Body(...)):
+    """{année: identifiant de dégradé, ou null pour reprendre celui de la couche globale}.
+    Seules les années dont le dégradé change sont recalculées."""
+    try:
+        settings.set_year_gradients(values)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    changed = engine.set_year_gradients(settings.effective()["year_gradients"])
+    changed &= set(engine.pts.years())
+    log.info("Dégradés des couches annuelles modifiés depuis l'admin")
+    job = submit_year_rerender(changed)[0].to_dict() if changed else None
+    return {**api_layers(), "job": job}
 
 
 @admin.get("/api/garmin")

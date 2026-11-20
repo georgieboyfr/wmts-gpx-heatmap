@@ -36,6 +36,13 @@ color_gradient:
   - [0.85, [190, 235, 255, 245]]
   - [1.00, [255, 255, 255, 255]]
 
+# Dégradé de chaque couche annuelle (heatmap-2024...), parmi les modèles : ice, fire, orange,
+# green, violet, viridis, white, graphite. Une année absente reprend color_gradient.
+# Plus simple : le choisir d'un clic dans l'onglet « Couches » de l'admin.
+year_gradients: {}
+#  2024: fire
+#  2025: green
+
 server:
   # URL publique par laquelle ton NAS sera joignable (utilisée dans le GetCapabilities)
   base_url: "http://ton-nas:8088"

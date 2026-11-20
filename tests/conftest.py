@@ -21,11 +21,13 @@ def make_config(tmp_path, **render):
     }
 
 
-def write_gpx(path, *segments, waypoints=()):
-    """Écrit un GPX ; chaque segment est une liste de (lat, lon). Change le mtime
-    à chaque réécriture, même sur un système de fichiers à résolution grossière."""
+def write_gpx(path, *segments, waypoints=(), time=None):
+    """Écrit un GPX ; chaque segment est une liste de (lat, lon), chaque point horodaté
+    `time` (ex : "2024-05-01T08:00:00Z") s'il est donné. Change le mtime à chaque
+    réécriture, même sur un système de fichiers à résolution grossière."""
+    stamp = f"<time>{time}</time>" if time else ""
     trksegs = "".join(
-        "<trkseg>" + "".join(f'<trkpt lat="{lat}" lon="{lon}"></trkpt>' for lat, lon in seg) + "</trkseg>"
+        "<trkseg>" + "".join(f'<trkpt lat="{lat}" lon="{lon}">{stamp}</trkpt>' for lat, lon in seg) + "</trkseg>"
         for seg in segments
     )
     wpts = "".join(f'<wpt lat="{lat}" lon="{lon}"></wpt>' for lat, lon in waypoints)

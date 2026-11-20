@@ -54,12 +54,16 @@ def _tcx_to_points(data: bytes):
     return points
 
 
-def _points_to_gpx_bytes(points, name: str) -> bytes:
+def _points_to_gpx_bytes(points, name: str, start=None) -> bytes:
+    """GPX minimal ; `start` (datetime UTC de l'activité) est écrit dans les métadonnées
+    pour que l'activité soit rangée dans la bonne couche annuelle."""
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<gpx version="1.1" creator="wmts-gpx-heatmap-garmin-fallback-tcx">',
-        f"<trk><name>{escape(name)}</name><trkseg>",
     ]
+    if start is not None:
+        lines.append(f"<metadata><time>{start.strftime('%Y-%m-%dT%H:%M:%SZ')}</time></metadata>")
+    lines.append(f"<trk><name>{escape(name)}</name><trkseg>")
     for lat, lon in points:
         lines.append(f'<trkpt lat="{lat:.7f}" lon="{lon:.7f}"></trkpt>')
     lines.append("</trkseg></trk></gpx>")
@@ -161,6 +165,7 @@ class GarminSync:
                 consecutive_known = 0
 
                 start_str = act.get("startTimeGMT")
+                act_time = None
                 if start_str:
                     try:
                         act_time = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
@@ -168,7 +173,7 @@ class GarminSync:
                             log.info("Limite d'historique atteinte (%s), arrêt.", start_str)
                             return
                     except ValueError:
-                        pass
+                        act_time = None
 
                 try:
                     data = client.download_activity(act_id, dl_fmt=Garmin.ActivityDownloadFormat.GPX)
@@ -196,7 +201,7 @@ class GarminSync:
                             tcx_data = client.download_activity(act_id, dl_fmt=Garmin.ActivityDownloadFormat.TCX)
                             points = _tcx_to_points(tcx_data)
                             if points:
-                                data = _points_to_gpx_bytes(points, name=f"garmin_{act_id}")
+                                data = _points_to_gpx_bytes(points, name=f"garmin_{act_id}", start=act_time)
                                 log.info("Activité %s : %d points récupérés via TCX", act_id, len(points))
                             else:
                                 log.info("Activité %s : TCX également sans points (activité sans GPS)", act_id)

@@ -44,6 +44,7 @@
       <button role="tab" data-tab="garmin"><span data-i18n="tab.garmin">Garmin</span> <span id="garmin-tab-dot" class="dot"></span></button>
       <button role="tab" data-tab="data" data-i18n="tab.data">Données</button>
       <button role="tab" data-tab="render" data-i18n="tab.render">Rendu</button>
+      <button role="tab" data-tab="layers" data-i18n="tab.layers">Couches</button>
       <button role="tab" data-tab="logs" data-i18n="tab.logs">Journal</button>
     </nav>
     <div class="topbar-actions">
@@ -249,6 +250,8 @@
             <span data-i18n="render.contrast">Contraste des faibles densités <small class="muted">0 = linéaire</small></span></div>
 
           <h3 data-i18n="render.gradient">Dégradé de couleurs</h3>
+          <p class="muted small" data-i18n="render.presets">Partir d'un modèle :</p>
+          <div class="swatches" id="render-presets"></div>
           <div class="gradient-bar" id="gradient-bar"></div>
           <div id="gradient-stops"></div>
           <button type="button" class="btn ghost small" id="add-stop" data-i18n="render.add_stop">+ Ajouter un palier</button>
@@ -276,6 +279,32 @@
           </div>
           <p class="muted small" data-i18n="map.hint">L'aperçu est calculé à la volée avec les réglages du formulaire, sans rien modifier.
             « Appliquer » enregistre les réglages et recalcule toutes les tuiles.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ----- Couches ----- -->
+    <section class="tab-panel" data-panel="layers" hidden>
+      <div class="layers-layout">
+        <div class="card">
+          <h2 data-i18n="layers.title">Couches publiées</h2>
+          <p class="muted small" data-i18n="layers.intro">Une heatmap pour toutes les années, une pour l'année en cours et une par année d'historique. Choisis le dégradé de chaque année d'un clic : seule cette année est recalculée.</p>
+          <div id="layers-notice"></div>
+          <div id="layers-list" class="layers-list"></div>
+        </div>
+
+        <div class="layers-side">
+          <div class="card">
+            <div class="card-head">
+              <h2 id="layer-map-title" data-i18n="map.title">Aperçu</h2>
+            </div>
+            <div class="map-wrap"><div id="layers-map" class="layers-map"></div></div>
+            <p class="muted small" data-i18n="layers.map_hint">Tuiles publiées de la couche sélectionnée.</p>
+          </div>
+          <div class="card">
+            <h2 data-i18n="layers.syntax">Syntaxe</h2>
+            <div id="layer-syntax"></div>
+          </div>
         </div>
       </div>
     </section>

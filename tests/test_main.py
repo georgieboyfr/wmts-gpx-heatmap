@@ -70,6 +70,43 @@ def test_tiles_kvp_restful_and_etag(main, client, tmp_path):
     assert client.get("/wmts", params={"REQUEST": "GetTile", "TILEMATRIX": "x"}).status_code == 400
 
 
+def test_year_layers_in_capabilities_tiles_and_admin(main, client, tmp_path):
+    from app.heatmap import current_year
+    year = current_year()
+    main.engine.bulk_ingest([
+        write_gpx(tmp_path / "gpx" / "old.gpx", [(48.85, 2.0), (48.85, 2.01)], time="2021-06-01T08:00:00Z"),
+        write_gpx(tmp_path / "gpx" / "new.gpx", [(48.85, 2.2), (48.85, 2.21)], time=f"{year}-01-02T08:00:00Z"),
+    ])
+    caps = ET.fromstring(client.get("/wmts", params={"REQUEST": "GetCapabilities"}).content)
+    ns = {"w": "http://www.opengis.net/wmts/1.0", "ows": "http://www.opengis.net/ows/1.1"}
+    ids = [e.text for e in caps.findall("w:Contents/w:Layer/ows:Identifier", ns)]
+    assert ids == ["heatmap", "heatmap-current", f"heatmap-{year}", "heatmap-2021"]
+
+    old, new = mercantile.tile(2.005, 48.85, 14), mercantile.tile(2.205, 48.85, 14)
+
+    def etag(layer, t):
+        return client.get(f"/wmts/1.0.0/{layer}/default/GoogleMapsCompatible/14/{t.y}/{t.x}.png").headers["etag"]
+    assert etag("heatmap-2021", old) != '"empty"' and etag("heatmap-2021", new) == '"empty"'
+    assert etag("heatmap-current", new) == etag(f"heatmap-{year}", new) != '"empty"'
+    assert etag("heatmap-current", old) == '"empty"'
+    kvp = client.get("/wmts", params={"REQUEST": "GetTile", "LAYER": "heatmap-2021", "TILEMATRIX": 14,
+                                      "TILEROW": new.y, "TILECOL": new.x})
+    assert kvp.headers["etag"] == '"empty"'
+
+    info = client.get("/admin/api/layers", headers=AUTH).json()
+    assert info["current_year"] == year and "fire" in info["presets"]
+    assert [(lay["id"], lay["files"]) for lay in info["layers"]] == [
+        ("heatmap", 2), ("heatmap-current", 1), (f"heatmap-{year}", 1), ("heatmap-2021", 1)]
+
+    before = main.engine.get_tile_path(14, new.x, new.y, year).read_bytes()
+    r = client.put("/admin/api/layers/gradients", json={"2021": "fire"}, headers=AUTH)
+    assert r.status_code == 200 and wait_job(main, r).status == "done"
+    assert r.json()["layers"][3]["gradient"] == "fire"
+    assert main.engine.get_tile_path(14, new.x, new.y, year).read_bytes() == before  # autre année intacte
+    assert client.put("/admin/api/layers/gradients", json={"2021": "fire"}, headers=AUTH).json()["job"] is None
+    assert client.put("/admin/api/layers/gradients", json={"2021": "nope"}, headers=AUTH).status_code == 400
+
+
 # ---------- authentification ----------
 
 def test_admin_page_is_public_but_api_is_not(client):

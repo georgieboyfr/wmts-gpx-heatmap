@@ -15,6 +15,8 @@ from pathlib import Path
 
 import yaml
 
+from .gradients import validate_year_gradients
+
 log = logging.getLogger("settings")
 
 RENDER_KEYS = ("min_zoom", "max_zoom", "line_width_px", "blur_sigma_px", "color_saturation", "contrast_boost")
@@ -84,7 +86,25 @@ class Settings:
         if "color_gradient" in ov:
             cfg["color_gradient"] = ov["color_gradient"]
         cfg["garmin"] = {**GARMIN_DEFAULTS, **(cfg.get("garmin") or {}), **ov.get("garmin", {})}
+        years = {**self._base_year_gradients(), **ov.get("year_gradients", {})}
+        cfg["year_gradients"] = {y: p for y, p in years.items() if p}
         return cfg
+
+    def _base_year_gradients(self) -> dict:
+        return {str(y): p for y, p in (self.base.get("year_gradients") or {}).items()}
+
+    def set_year_gradients(self, values: dict):
+        """Dégradé choisi pour une ou plusieurs années (None = celui de la couche « toutes
+        années »). Seuls les choix qui diffèrent de config.yaml sont gardés."""
+        values = validate_year_gradients(values)
+        base = self._base_year_gradients()
+        with self._lock:
+            merged = {**self._overrides.get("year_gradients", {}), **values}
+            diff = {y: p for y, p in merged.items() if p != base.get(y)}
+            self._overrides.pop("year_gradients", None)
+            if diff:
+                self._overrides["year_gradients"] = dict(sorted(diff.items()))
+            self._save()
 
     def overrides(self) -> dict:
         with self._lock:

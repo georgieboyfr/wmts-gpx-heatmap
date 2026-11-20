@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Features
+- **One heatmap per year**: besides `heatmap` (all years), every year with activities gets its own WMTS layer (`heatmap-2024`, `heatmap-2025`...), plus `heatmap-current`, a stable address for the current year that moves on by itself on January 1st. All of them are listed in `GetCapabilities`. A new activity only recomputes its own year and the all-years layer.
+- **Gradient presets**: eight ready-made gradients (Ice, Fire, Orange, Green, Violet, Viridis, White, Graphite). Each year layer takes one in a click, or keeps the all-years gradient; `year_gradients` in `config.yaml` sets them too. Changing a year's gradient only recomputes that year.
+- The year of an activity is read from its GPX timestamps; Garmin activities recovered through the TCX fallback now carry their start date. Files without any date only appear in the all-years layer.
+
+### Admin
+- New **Layers** tab: every published layer with its activity count, a map of its tiles, clickable gradient swatches per year, and the URL syntax ready to copy (tile URL, GetCapabilities, GetTile, Leaflet).
+- **Render** tab: start the all-years gradient from a preset in one click.
+
+### Upgrading
+- Activities imported by an earlier version get their year at the first startup (*Reading activity dates* task, which then computes the year layers); no reindex needed. Year layers take about as much disk space again as the all-years layer.
+
 ## 1.0.8 — 2026-10-29
 
 ### Performance
